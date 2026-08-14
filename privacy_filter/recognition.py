@@ -12,6 +12,21 @@ from .ort_session import create_inference_session
 
 
 FACE_PREPROCESSING = "bbox_square_1.20_v1"
+FACE_ROTATION_ANGLES = (0, 90, 180, 270)
+
+
+def rotate_face(face_image: np.ndarray, angle: int) -> np.ndarray:
+    if face_image.shape != (112, 112, 3):
+        raise ValueError(f"Expected a 112x112 BGR face, got {face_image.shape}")
+    if angle == 0:
+        return face_image
+    if angle == 90:
+        return cv2.rotate(face_image, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(face_image, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(face_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError(f"Unsupported face rotation: {angle}")
 
 
 @dataclass(frozen=True)

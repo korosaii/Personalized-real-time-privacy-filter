@@ -15,7 +15,12 @@ from .enrollment import (
 )
 from .model_setup import RuntimeModels, prepare_runtime_models
 from .ort_session import PROVIDER_CHOICES
-from .recognition import FACE_PREPROCESSING, FaceEmbedder
+from .recognition import (
+    FACE_PREPROCESSING,
+    FACE_ROTATION_ANGLES,
+    FaceEmbedder,
+    rotate_face,
+)
 from .yolo import YOLOFaceDetector
 
 
@@ -108,22 +113,30 @@ def embedding_from_photo(
     face_count = len(detected.detections)
     if face_count != 1:
         return None, f"expected exactly one face, found {face_count}"
-    embedded = embedder.embed_bbox(photo, detected.detections[0])
+    face_image = embedder.extract_face(photo, detected.detections[0])
     quality = assess_face_quality(
-        embedded.face_image,
+        face_image,
         detected.detections[0],
         min_face_size=min_face_size,
         min_sharpness=min_sharpness,
     )
     if not quality.accepted:
         return None, quality.reason
-    return embedded.embedding, "accepted"
+    embeddings = [
+        embedder.embed_face(rotate_face(face_image, angle))[0]
+        for angle in FACE_ROTATION_ANGLES
+    ]
+    return np.stack(embeddings).astype(np.float32), "accepted"
 
 
 def is_new_sample(candidate: np.ndarray, accepted: list[np.ndarray]) -> bool:
     if not accepted:
         return True
-    similarities = np.asarray(accepted, dtype=np.float32) @ candidate
+    similarities = np.einsum(
+        "ad,nad->na",
+        np.asarray(candidate, dtype=np.float32),
+        np.asarray(accepted, dtype=np.float32),
+    )
     return float(similarities.max()) < 0.9999
 
 
@@ -183,9 +196,10 @@ def main() -> None:
     print(f"Template saved: {saved}")
     print(f"Accepted photos: {len(accepted)}; rejected: {rejected}")
     print(
-        "Genuine scores to centroid: "
+        "Genuine scores to rotation centroids: "
         f"min={scores.min():.3f}, mean={scores.mean():.3f}, max={scores.max():.3f}"
     )
+    print(f"Rotation centroids: {list(template.rotation_angles)} degrees")
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
     if len(accepted) == 1:

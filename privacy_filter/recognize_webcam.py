@@ -59,8 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--authorized-recheck-interval",
         type=int,
-        default=300,
-        help="Safety recheck for a stable authorized track in frames; 0 disables it",
+        default=125,
+        help=(
+            "Safety recheck for a stable authorized track in frames; "
+            "default 125 is 5 seconds at 25 FPS; 0 disables it"
+        ),
     )
     parser.add_argument(
         "--minimum-recognition-face-size",
@@ -318,6 +321,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_warmup = embedder.warmup(2)
     print(f"Identity: {template.name}")
     print(f"Template samples: {len(template.embeddings)}")
+    print(f"Template rotation centroids: {list(template.rotation_angles)} degrees")
     print(f"Authorization threshold: {threshold:.3f}")
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
