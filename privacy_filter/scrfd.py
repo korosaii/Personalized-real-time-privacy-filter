@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any
 
 import cv2
 import numpy as np
 import onnx
-import onnxruntime as ort
+
+from .ort_session import create_inference_session
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,7 @@ class SCRFDDetector:
         self.input_size = input_size
         self.threshold = threshold
         self.nms_threshold = nms_threshold
+        self._provider_policy = provider.lower()
         self._anchor_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
         self.provider_warning: str | None = None
         self.static_model_input_size = self._static_model_input_size()
@@ -103,7 +104,14 @@ class SCRFDDetector:
                 f"{self.input_size}. Use matching --model and --det-size values."
             )
         self.has_static_input = self.static_model_input_size is not None
-        self.session = self._create_session(provider)
+        created = create_inference_session(
+            self.model_path,
+            provider,
+            self.has_static_input,
+            "detector",
+        )
+        self.session = created.session
+        self.provider_warning = created.warning
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [output.name for output in self.session.get_outputs()]
 
@@ -134,55 +142,6 @@ class SCRFDDetector:
         if static_shape[0:2] != [1, 3] or static_shape[2] <= 0 or static_shape[3] <= 0:
             return None
         return static_shape[3], static_shape[2]
-
-    def _create_session(self, provider: str) -> ort.InferenceSession:
-        provider = provider.lower()
-        available = ort.get_available_providers()
-        if provider not in {"auto", "cpu", "coreml"}:
-            raise ValueError("provider must be one of: auto, cpu, coreml")
-
-        cpu = ["CPUExecutionProvider"]
-        coreml_cache = Path.cwd() / ".cache" / "coreml"
-        coreml_cache.mkdir(parents=True, exist_ok=True)
-        coreml: list[Any] = [
-            (
-                "CoreMLExecutionProvider",
-                {
-                    "ModelFormat": "MLProgram",
-                    "MLComputeUnits": "ALL",
-                    "RequireStaticInputShapes": "1" if self.has_static_input else "0",
-                    "ModelCacheDirectory": str(coreml_cache),
-                },
-            ),
-            "CPUExecutionProvider",
-        ]
-        if provider == "coreml" and "CoreMLExecutionProvider" not in available:
-            raise RuntimeError(
-                "This ONNX Runtime build does not include CoreMLExecutionProvider. "
-                f"Available providers: {available}"
-            )
-
-        requested = coreml if provider == "coreml" else cpu
-        if provider == "auto" and "CoreMLExecutionProvider" in available:
-            requested = coreml
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            return ort.InferenceSession(
-                str(self.model_path),
-                sess_options=options,
-                providers=requested,
-            )
-        except Exception as error:
-            if provider == "auto" and requested is coreml:
-                self.provider_warning = f"CoreML initialization failed; using CPU: {error}"
-                return ort.InferenceSession(
-                    str(self.model_path),
-                    sess_options=options,
-                    providers=cpu,
-                )
-            raise
 
     @staticmethod
     def _flatten_prediction(output: np.ndarray, values_per_anchor: int) -> np.ndarray:
@@ -223,6 +182,26 @@ class SCRFDDetector:
         self._anchor_cache[key] = centers
         return centers
 
+    def _run(self, blob: np.ndarray) -> list[np.ndarray]:
+        try:
+            return self.session.run(self.output_names, {self.input_name: blob})
+        except Exception as error:
+            providers = self.session.get_providers()
+            if self._provider_policy != "auto" or providers[0] == "CPUExecutionProvider":
+                raise
+            failed_provider = providers[0]
+            created = create_inference_session(
+                self.model_path,
+                "cpu",
+                self.has_static_input,
+                "detector",
+            )
+            self.session = created.session
+            self.provider_warning = (
+                f"{failed_provider} inference failed; using CPU: {error}"
+            )
+            return self.session.run(self.output_names, {self.input_name: blob})
+
     def _preprocess(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
         input_width, input_height = self.input_size
         frame_height, frame_width = frame.shape[:2]
@@ -247,7 +226,7 @@ class SCRFDDetector:
 
         started = perf_counter()
         blob, scale = self._preprocess(frame)
-        outputs = self.session.run(self.output_names, {self.input_name: blob})
+        outputs = self._run(blob)
 
         scores_out: list[np.ndarray] = []
         boxes_out: list[np.ndarray] = []

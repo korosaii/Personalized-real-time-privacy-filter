@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 
 import onnx
-import onnxruntime as ort
+
+from .ort_session import preferred_execution_provider
 
 
 DETECTOR_CANDIDATES = (
@@ -26,7 +27,7 @@ class RuntimeModels:
     detector_runtime: Path
     recognition_runtime: Path
     recognition_source_sha256: str
-    coreml_enabled: bool
+    preferred_execution_provider: str
     generated: tuple[Path, ...]
 
 
@@ -146,20 +147,6 @@ def _prepare_recognition(
     return target, True
 
 
-def coreml_enabled(provider: str) -> bool:
-    normalized = provider.lower()
-    if normalized not in {"auto", "cpu", "coreml"}:
-        raise ValueError("provider must be one of: auto, cpu, coreml")
-    available = ort.get_available_providers()
-    if normalized == "coreml" and "CoreMLExecutionProvider" not in available:
-        raise RuntimeError(
-            "CoreML is unavailable on this system. Use --provider cpu or --provider auto."
-        )
-    return normalized == "coreml" or (
-        normalized == "auto" and "CoreMLExecutionProvider" in available
-    )
-
-
 def prepare_runtime_models(
     detector_model: str | Path | None,
     recognition_model: str | Path | None,
@@ -176,7 +163,7 @@ def prepare_runtime_models(
         raise ValueError("Detector inference requires an ONNX model")
     if recognition_source.suffix.lower() != ".onnx":
         raise ValueError("Recognition inference requires an ONNX model")
-    use_coreml = coreml_enabled(provider)
+    preferred_provider = preferred_execution_provider(provider)
     resolved_cache = Path(cache_dir).expanduser().resolve()
     recognition_source_sha256 = _file_sha256(recognition_source)
     detector_runtime, detector_generated = _prepare_detector(
@@ -203,6 +190,6 @@ def prepare_runtime_models(
         detector_runtime,
         recognition_runtime,
         recognition_source_sha256,
-        use_coreml,
+        preferred_provider,
         generated,
     )

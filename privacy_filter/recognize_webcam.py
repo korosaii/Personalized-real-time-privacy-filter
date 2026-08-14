@@ -16,6 +16,7 @@ import numpy as np
 from .camera import Camera
 from .enrollment import load_template, sha256_file
 from .model_setup import prepare_runtime_models
+from .ort_session import PROVIDER_CHOICES
 from .recognition import FaceEmbedder
 from .redaction import blur_faces, redact_entire_frame
 from .scrfd import SCRFDDetector
@@ -47,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--template", default="data/enrollments/owner.npz")
     parser.add_argument("--detector-model", type=Path, default=None)
     parser.add_argument("--recognition-model", type=Path, default=None)
-    parser.add_argument("--provider", choices=("auto", "cpu", "coreml"), default="auto")
+    parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
     parser.add_argument("--threshold", type=float, default=None, help="Override template threshold")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
@@ -222,6 +223,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     print(f"Authorization threshold: {threshold:.3f}")
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
+    for warning in (detector.provider_warning, embedder.provider_warning):
+        if warning:
+            print(f"Provider warning: {warning}", file=sys.stderr)
     print(f"Recognition warmup: {[round(value, 2) for value in recognition_warmup]} ms")
     print(
         f"Safe state: {args.confirmations} confirmations, recognition every "
@@ -464,12 +468,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "detector_providers": detector.providers,
         "recognition_providers": embedder.providers,
+        "provider_warnings": [
+            warning
+            for warning in (detector.provider_warning, embedder.provider_warning)
+            if warning
+        ],
         "models": {
             "detector_source": str(models.detector_source),
             "detector_runtime": str(models.detector_runtime),
             "recognition_source": str(models.recognition_source),
             "recognition_runtime": str(models.recognition_runtime),
-            "coreml_enabled": models.coreml_enabled,
+            "preferred_execution_provider": models.preferred_execution_provider,
         },
         "frames": frames,
         "failures": failures,

@@ -2,7 +2,7 @@
 
 Real-time фильтр для камеры: зарегистрированный владелец остаётся видимым, остальные обнаруженные лица размываются.
 
-Проект использует SCRFD-10G_KPS, iResNet-50/ArcFace, ONNX Runtime и OpenCV. Он работает на macOS и Windows. На Apple Silicon автоматически используется CoreML, на остальных системах — ONNX Runtime CPU.
+Проект использует SCRFD-10G_KPS, iResNet-50/ArcFace, ONNX Runtime и OpenCV. Он работает на macOS и Windows. На Apple Silicon автоматически используется CoreML. На Windows автоматически используется DirectML с любой совместимой NVIDIA, AMD или Intel GPU, а при недоступности GPU — CPU.
 
 ## Клонирование
 
@@ -37,6 +37,8 @@ Windows:
 python -m pip install --upgrade pip setuptools
 python -m pip install -r requirements.txt
 ```
+
+На Windows пакет DirectML устанавливается автоматически. Выбирать модель видеокарты или provider вручную не нужно.
 
 Разрешите доступ к камере для Terminal или VS Code в настройках приватности операционной системы.
 

@@ -3,14 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any
 
 import cv2
 import numpy as np
 import onnx
-import onnxruntime as ort
 
 from .face_align import align_face
+from .ort_session import create_inference_session
 
 
 @dataclass(frozen=True)
@@ -35,6 +34,7 @@ def cosine_similarity(first: np.ndarray, second: np.ndarray) -> float:
 class FaceEmbedder:
     def __init__(self, model_path: str | Path, provider: str = "auto") -> None:
         self.model_path = Path(model_path).expanduser().resolve()
+        self._provider_policy = provider.lower()
         if not self.model_path.is_file():
             raise FileNotFoundError(f"Recognition ONNX model not found: {self.model_path}")
         if self.model_path.suffix.lower() != ".onnx":
@@ -45,7 +45,14 @@ class FaceEmbedder:
         self.input_mean, self.input_std = self._preprocessing_from_graph(model)
         self.has_static_batch = self._has_static_batch(model)
         self.provider_warning: str | None = None
-        self.session = self._create_session(provider)
+        created = create_inference_session(
+            self.model_path,
+            provider,
+            self.has_static_batch,
+            "recognition",
+        )
+        self.session = created.session
+        self.provider_warning = created.warning
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
@@ -75,50 +82,6 @@ class FaceEmbedder:
     def providers(self) -> list[str]:
         return self.session.get_providers()
 
-    def _create_session(self, provider: str) -> ort.InferenceSession:
-        provider = provider.lower()
-        if provider not in {"auto", "cpu", "coreml"}:
-            raise ValueError("provider must be one of: auto, cpu, coreml")
-        available = ort.get_available_providers()
-        cpu = ["CPUExecutionProvider"]
-        cache = Path.cwd() / ".cache" / "coreml"
-        cache.mkdir(parents=True, exist_ok=True)
-        coreml: list[Any] = [
-            (
-                "CoreMLExecutionProvider",
-                {
-                    "ModelFormat": "MLProgram",
-                    "MLComputeUnits": "ALL",
-                    "RequireStaticInputShapes": "1" if self.has_static_batch else "0",
-                    "ModelCacheDirectory": str(cache),
-                },
-            ),
-            "CPUExecutionProvider",
-        ]
-        if provider == "coreml" and "CoreMLExecutionProvider" not in available:
-            raise RuntimeError(f"CoreML is unavailable; providers: {available}")
-        requested = coreml if provider == "coreml" else cpu
-        if provider == "auto" and "CoreMLExecutionProvider" in available:
-            requested = coreml
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            return ort.InferenceSession(
-                str(self.model_path),
-                sess_options=options,
-                providers=requested,
-            )
-        except Exception as error:
-            if provider == "auto" and requested is coreml:
-                self.provider_warning = f"CoreML initialization failed; using CPU: {error}"
-                return ort.InferenceSession(
-                    str(self.model_path),
-                    sess_options=options,
-                    providers=cpu,
-                )
-            raise
-
     def embed_aligned(self, aligned_face: np.ndarray) -> tuple[np.ndarray, float]:
         if aligned_face.shape != (112, 112, 3):
             raise ValueError(f"Expected an aligned 112x112 BGR face, got {aligned_face.shape}")
@@ -130,7 +93,24 @@ class FaceEmbedder:
             mean=(self.input_mean, self.input_mean, self.input_mean),
             swapRB=True,
         )
-        raw = self.session.run([self.output_name], {self.input_name: blob})[0]
+        try:
+            raw = self.session.run([self.output_name], {self.input_name: blob})[0]
+        except Exception as error:
+            providers = self.session.get_providers()
+            if self._provider_policy != "auto" or providers[0] == "CPUExecutionProvider":
+                raise
+            failed_provider = providers[0]
+            created = create_inference_session(
+                self.model_path,
+                "cpu",
+                self.has_static_batch,
+                "recognition",
+            )
+            self.session = created.session
+            self.provider_warning = (
+                f"{failed_provider} inference failed; using CPU: {error}"
+            )
+            raw = self.session.run([self.output_name], {self.input_name: blob})[0]
         embedding = l2_normalize(raw)
         return embedding, (perf_counter() - started) * 1000.0
 

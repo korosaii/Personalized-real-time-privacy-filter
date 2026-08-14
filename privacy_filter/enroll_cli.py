@@ -14,6 +14,7 @@ from .enrollment import (
     save_template,
 )
 from .model_setup import RuntimeModels, prepare_runtime_models
+from .ort_session import PROVIDER_CHOICES
 from .recognition import FaceEmbedder
 from .scrfd import SCRFDDetector
 
@@ -35,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--detector-model", type=Path, default=None)
     parser.add_argument("--recognition-model", type=Path, default=None)
-    parser.add_argument("--provider", choices=("auto", "cpu", "coreml"), default="auto")
+    parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
     parser.add_argument("--threshold", type=float, default=0.50)
     parser.add_argument("--min-face-size", type=float, default=96.0)
     parser.add_argument("--min-sharpness", type=float, default=25.0)
@@ -87,6 +88,9 @@ def load_models(
     embedder.warmup(2)
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
+    for warning in (detector.provider_warning, embedder.provider_warning):
+        if warning:
+            print(f"Provider warning: {warning}", file=sys.stderr)
     return detector, embedder, models
 
 
