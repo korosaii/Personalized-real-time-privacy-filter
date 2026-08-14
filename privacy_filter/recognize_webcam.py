@@ -15,6 +15,7 @@ import numpy as np
 
 from .camera import Camera
 from .enrollment import load_template, sha256_file
+from .model_setup import prepare_runtime_models
 from .recognition import FaceEmbedder
 from .redaction import blur_faces, redact_entire_frame
 from .scrfd import SCRFDDetector
@@ -44,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Real-time personalized face privacy filter."
     )
     parser.add_argument("--template", default="data/enrollments/owner.npz")
-    parser.add_argument("--detector-model", default="models/detector/det_10g_512.onnx")
-    parser.add_argument("--recognition-model", default="models/recognition/webface_r50_112.onnx")
+    parser.add_argument("--detector-model", type=Path, default=None)
+    parser.add_argument("--recognition-model", type=Path, default=None)
     parser.add_argument("--provider", choices=("auto", "cpu", "coreml"), default="auto")
     parser.add_argument("--threshold", type=float, default=None, help="Override template threshold")
     parser.add_argument("--camera", type=int, default=0)
@@ -178,8 +179,21 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     template = load_template(args.template)
-    recognition_hash = sha256_file(args.recognition_model)
-    if recognition_hash != template.model_sha256:
+    models = prepare_runtime_models(
+        args.detector_model,
+        args.recognition_model,
+        args.provider,
+    )
+    if models.generated:
+        print("Preparing optimized runtime model cache:")
+        for path in models.generated:
+            print(f"  {path}")
+    recognition_matches = template.model_sha256 == models.recognition_source_sha256
+    if not recognition_matches and models.recognition_runtime != models.recognition_source:
+        recognition_matches = template.model_sha256 == sha256_file(
+            models.recognition_runtime
+        )
+    if not recognition_matches:
         raise ValueError(
             "Enrollment was created with a different recognition model. "
             "Re-run privacy-enroll with the current model."
@@ -188,12 +202,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     _validate_args(args, threshold)
 
     detector = SCRFDDetector(
-        args.detector_model,
+        models.detector_runtime,
         input_size=(512, 512),
         threshold=0.40,
         provider=args.provider,
     )
-    embedder = FaceEmbedder(args.recognition_model, provider=args.provider)
+    embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
     tracker = FaceTracker(
         iou_threshold=args.track_iou_threshold,
         max_missed_frames=args.track_max_missed,
@@ -223,7 +237,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     print("Privacy rule: PENDING, UNKNOWN, stale, lost, or failed recognition => blurred.")
 
     camera = Camera(args.camera, args.width, args.height, args.camera_fps)
-    print(f"Camera: {camera.info.width}x{camera.info.height} at reported {camera.info.fps:.1f} FPS")
+    print(
+        f"Camera: {camera.info.width}x{camera.info.height} at reported "
+        f"{camera.info.fps:.1f} FPS ({camera.info.backend})"
+    )
     started = perf_counter()
     rolling_ms: deque[float] = deque(maxlen=120)
     detector_latencies: list[float] = []
@@ -447,6 +464,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "detector_providers": detector.providers,
         "recognition_providers": embedder.providers,
+        "models": {
+            "detector_source": str(models.detector_source),
+            "detector_runtime": str(models.detector_runtime),
+            "recognition_source": str(models.recognition_source),
+            "recognition_runtime": str(models.recognition_runtime),
+            "coreml_enabled": models.coreml_enabled,
+        },
         "frames": frames,
         "failures": failures,
         "interrupted": interrupted,

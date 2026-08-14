@@ -12,8 +12,8 @@ from .enrollment import (
     build_template,
     safe_identity_name,
     save_template,
-    sha256_file,
 )
+from .model_setup import RuntimeModels, prepare_runtime_models
 from .recognition import FaceEmbedder
 from .scrfd import SCRFDDetector
 
@@ -33,8 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Photographs or folders containing photographs",
     )
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--detector-model", default="models/detector/det_10g_512.onnx")
-    parser.add_argument("--recognition-model", default="models/recognition/webface_r50_112.onnx")
+    parser.add_argument("--detector-model", type=Path, default=None)
+    parser.add_argument("--recognition-model", type=Path, default=None)
     parser.add_argument("--provider", choices=("auto", "cpu", "coreml"), default="auto")
     parser.add_argument("--threshold", type=float, default=0.50)
     parser.add_argument("--min-face-size", type=float, default=96.0)
@@ -62,21 +62,32 @@ def expand_photos(paths: list[Path]) -> list[Path]:
     return list(dict.fromkeys(discovered))
 
 
-def load_models(args: argparse.Namespace) -> tuple[SCRFDDetector, FaceEmbedder]:
-    detector = SCRFDDetector(
+def load_models(
+    args: argparse.Namespace,
+) -> tuple[SCRFDDetector, FaceEmbedder, RuntimeModels]:
+    models = prepare_runtime_models(
         args.detector_model,
+        args.recognition_model,
+        args.provider,
+    )
+    if models.generated:
+        print("Preparing optimized runtime model cache:")
+        for path in models.generated:
+            print(f"  {path}")
+    detector = SCRFDDetector(
+        models.detector_runtime,
         input_size=(512, 512),
         threshold=0.50,
         provider=args.provider,
     )
-    embedder = FaceEmbedder(args.recognition_model, provider=args.provider)
+    embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
     blank = np.zeros((512, 512, 3), dtype=np.uint8)
     detector.detect(blank)
     detector.detect(blank)
     embedder.warmup(2)
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
-    return detector, embedder
+    return detector, embedder, models
 
 
 def embedding_from_photo(
@@ -128,7 +139,7 @@ def main() -> None:
         )
     print(f"Found {len(photos)} photograph(s). Raw photos will not be copied.")
 
-    detector, embedder = load_models(args)
+    detector, embedder, models = load_models(args)
     accepted: list[np.ndarray] = []
     rejected = 0
     for path in photos:
@@ -161,7 +172,7 @@ def main() -> None:
     template = build_template(
         safe_name,
         accepted,
-        model_sha256=sha256_file(args.recognition_model),
+        model_sha256=models.recognition_source_sha256,
         threshold=args.threshold,
         source="photos",
     )

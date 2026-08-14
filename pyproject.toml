@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "realtime-privacy-filter"
 version = "0.1.0"
-description = "Real-time personalized face privacy filter for Apple Silicon"
+description = "Cross-platform real-time personalized face privacy filter"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
