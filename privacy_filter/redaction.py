@@ -26,25 +26,18 @@ def expand_box(
     )
 
 
-def _strong_blur(region: np.ndarray) -> np.ndarray:
+def _pixelate(region: np.ndarray) -> np.ndarray:
     height, width = region.shape[:2]
     if height < 2 or width < 2:
         return region
 
-
-    small_width = max(2, min(16, width // 12))
-    small_height = max(2, min(16, height // 12))
+    small_width = max(2, min(8, width // 16))
+    small_height = max(2, min(8, height // 16))
     reduced = cv2.resize(region, (small_width, small_height), interpolation=cv2.INTER_AREA)
-    redacted = cv2.resize(reduced, (width, height), interpolation=cv2.INTER_LINEAR)
-
-    min_side = min(width, height)
-    kernel = min(31, min_side if min_side % 2 == 1 else min_side - 1)
-    if kernel >= 3:
-        redacted = cv2.GaussianBlur(redacted, (kernel, kernel), sigmaX=0)
-    return redacted
+    return cv2.resize(reduced, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
-def blur_faces(
+def pixelate_faces(
     frame: np.ndarray,
     detections: np.ndarray,
     padding: float = 0.18,
@@ -61,7 +54,7 @@ def blur_faces(
         )
         if x2 <= x1 or y2 <= y1:
             continue
-        output[y1:y2, x1:x2] = _strong_blur(output[y1:y2, x1:x2])
+        output[y1:y2, x1:x2] = _pixelate(output[y1:y2, x1:x2])
 
     return output
 

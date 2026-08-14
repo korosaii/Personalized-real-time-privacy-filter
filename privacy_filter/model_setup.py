@@ -11,12 +11,10 @@ from .ort_session import preferred_execution_provider
 
 
 DETECTOR_CANDIDATES = (
-    Path("models/detector/det_10g.onnx"),
-    Path("models/detector/det_10g_512.onnx"),
+    Path("models/detector/yolov11n-face.onnx"),
 )
 RECOGNITION_CANDIDATES = (
-    Path("models/recognition/webface_r50.onnx"),
-    Path("models/recognition/webface_r50_112.onnx"),
+    Path("models/recognition/w600k_mbf.onnx"),
 )
 
 
@@ -91,28 +89,14 @@ def _save_model(model: onnx.ModelProto, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _prepare_detector(source: Path, cache_dir: Path, size: int) -> tuple[Path, bool]:
+def _prepare_detector(source: Path) -> tuple[Path, bool]:
     model = onnx.load_model(source)
-    if _shape(model.graph.input[0]) == [1, 3, size, size]:
-        return source, False
-    if len(model.graph.input) != 1 or len(model.graph.output) != 9:
-        raise ValueError("Expected an SCRFD_KPS ONNX graph with one input and nine outputs")
-    input_shape = model.graph.input[0].type.tensor_type.shape.dim
-    if len(input_shape) != 4:
-        raise ValueError("SCRFD input must be four-dimensional")
-    target = _cache_path(source, f"{size}x{size}", cache_dir)
-    if target.is_file():
-        return target, False
-    for dimension, value in zip(input_shape, (1, 3, size, size), strict=True):
-        _set_dimension(dimension, value)
-    counts = [2 * (size // stride) ** 2 for stride in (8, 16, 32)]
-    for output_index, value_info in enumerate(model.graph.output):
-        output_shape = value_info.type.tensor_type.shape.dim
-        if not output_shape:
-            raise ValueError("SCRFD output shape is missing")
-        _set_dimension(output_shape[0], counts[output_index % 3])
-    _save_model(model, target)
-    return target, True
+    if len(model.graph.input) != 1 or len(model.graph.output) != 1:
+        raise ValueError("Expected a YOLO detect graph with one input and one output")
+    shape = _shape(model.graph.input[0])
+    if len(shape) != 4 or shape[0:2] != [1, 3] or min(shape[2:]) <= 0:
+        raise ValueError(f"Expected a static YOLO input [1,3,H,W], got {shape}")
+    return source, False
 
 
 def _prepare_recognition(
@@ -166,11 +150,7 @@ def prepare_runtime_models(
     preferred_provider = preferred_execution_provider(provider)
     resolved_cache = Path(cache_dir).expanduser().resolve()
     recognition_source_sha256 = _file_sha256(recognition_source)
-    detector_runtime, detector_generated = _prepare_detector(
-        detector_source,
-        resolved_cache,
-        512,
-    )
+    detector_runtime, detector_generated = _prepare_detector(detector_source)
     recognition_runtime, recognition_generated = _prepare_recognition(
         recognition_source,
         resolved_cache,

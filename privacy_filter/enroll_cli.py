@@ -15,8 +15,8 @@ from .enrollment import (
 )
 from .model_setup import RuntimeModels, prepare_runtime_models
 from .ort_session import PROVIDER_CHOICES
-from .recognition import FaceEmbedder
-from .scrfd import SCRFDDetector
+from .recognition import FACE_PREPROCESSING, FaceEmbedder
+from .yolo import YOLOFaceDetector
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -37,8 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detector-model", type=Path, default=None)
     parser.add_argument("--recognition-model", type=Path, default=None)
     parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
-    parser.add_argument("--threshold", type=float, default=0.50)
-    parser.add_argument("--min-face-size", type=float, default=96.0)
+    parser.add_argument("--threshold", type=float, default=0.35)
+    parser.add_argument("--min-face-size", type=float, default=80.0)
     parser.add_argument("--min-sharpness", type=float, default=25.0)
     return parser
 
@@ -65,7 +65,7 @@ def expand_photos(paths: list[Path]) -> list[Path]:
 
 def load_models(
     args: argparse.Namespace,
-) -> tuple[SCRFDDetector, FaceEmbedder, RuntimeModels]:
+) -> tuple[YOLOFaceDetector, FaceEmbedder, RuntimeModels]:
     models = prepare_runtime_models(
         args.detector_model,
         args.recognition_model,
@@ -75,14 +75,13 @@ def load_models(
         print("Preparing optimized runtime model cache:")
         for path in models.generated:
             print(f"  {path}")
-    detector = SCRFDDetector(
+    detector = YOLOFaceDetector(
         models.detector_runtime,
-        input_size=(512, 512),
-        threshold=0.50,
+        threshold=0.25,
         provider=args.provider,
     )
     embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
-    blank = np.zeros((512, 512, 3), dtype=np.uint8)
+    blank = np.zeros((detector.input_size[1], detector.input_size[0], 3), dtype=np.uint8)
     detector.detect(blank)
     detector.detect(blank)
     embedder.warmup(2)
@@ -96,7 +95,7 @@ def load_models(
 
 def embedding_from_photo(
     path: Path,
-    detector: SCRFDDetector,
+    detector: YOLOFaceDetector,
     embedder: FaceEmbedder,
     min_face_size: float,
     min_sharpness: float,
@@ -109,12 +108,9 @@ def embedding_from_photo(
     face_count = len(detected.detections)
     if face_count != 1:
         return None, f"expected exactly one face, found {face_count}"
-    if detected.keypoints is None or len(detected.keypoints) != 1:
-        return None, "five facial keypoints are unavailable"
-
-    embedded = embedder.embed(photo, detected.keypoints[0])
+    embedded = embedder.embed_bbox(photo, detected.detections[0])
     quality = assess_face_quality(
-        embedded.aligned_face,
+        embedded.face_image,
         detected.detections[0],
         min_face_size=min_face_size,
         min_sharpness=min_sharpness,
@@ -179,6 +175,7 @@ def main() -> None:
         model_sha256=models.recognition_source_sha256,
         threshold=args.threshold,
         source="photos",
+        face_preprocessing=FACE_PREPROCESSING,
     )
     saved = save_template(template, output)
     scores = template.genuine_scores

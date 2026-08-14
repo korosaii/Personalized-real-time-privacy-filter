@@ -8,14 +8,16 @@ import cv2
 import numpy as np
 import onnx
 
-from .face_align import align_face
 from .ort_session import create_inference_session
+
+
+FACE_PREPROCESSING = "bbox_square_1.20_v1"
 
 
 @dataclass(frozen=True)
 class EmbeddingResult:
     embedding: np.ndarray
-    aligned_face: np.ndarray
+    face_image: np.ndarray
     latency_ms: float
 
 
@@ -82,12 +84,12 @@ class FaceEmbedder:
     def providers(self) -> list[str]:
         return self.session.get_providers()
 
-    def embed_aligned(self, aligned_face: np.ndarray) -> tuple[np.ndarray, float]:
-        if aligned_face.shape != (112, 112, 3):
-            raise ValueError(f"Expected an aligned 112x112 BGR face, got {aligned_face.shape}")
+    def embed_face(self, face_image: np.ndarray) -> tuple[np.ndarray, float]:
+        if face_image.shape != (112, 112, 3):
+            raise ValueError(f"Expected a 112x112 BGR face, got {face_image.shape}")
         started = perf_counter()
         blob = cv2.dnn.blobFromImage(
-            aligned_face,
+            face_image,
             scalefactor=1.0 / self.input_std,
             size=(112, 112),
             mean=(self.input_mean, self.input_mean, self.input_mean),
@@ -114,11 +116,47 @@ class FaceEmbedder:
         embedding = l2_normalize(raw)
         return embedding, (perf_counter() - started) * 1000.0
 
-    def embed(self, frame: np.ndarray, keypoints: np.ndarray) -> EmbeddingResult:
-        aligned = align_face(frame, keypoints)
-        embedding, latency_ms = self.embed_aligned(aligned)
-        return EmbeddingResult(embedding, aligned, latency_ms)
+    @staticmethod
+    def extract_face(
+        frame: np.ndarray,
+        detection: np.ndarray,
+        scale: float = 1.20,
+    ) -> np.ndarray:
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("frame must be a BGR image with shape HxWx3")
+        box = np.asarray(detection, dtype=np.float32).reshape(-1)
+        if box.size < 4 or not np.isfinite(box[:4]).all():
+            raise ValueError("detection must contain a finite bbox")
+        x1, y1, x2, y2 = (float(value) for value in box[:4])
+        width = x2 - x1
+        height = y2 - y1
+        if width < 2.0 or height < 2.0:
+            raise ValueError("face bbox is too small")
+        side = max(width, height) * scale
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        left = center_x - side / 2.0
+        top = center_y - side / 2.0
+        transform = np.asarray(
+            [
+                [side / 112.0, 0.0, left],
+                [0.0, side / 112.0, top],
+            ],
+            dtype=np.float32,
+        )
+        return cv2.warpAffine(
+            frame,
+            transform,
+            (112, 112),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    def embed_bbox(self, frame: np.ndarray, detection: np.ndarray) -> EmbeddingResult:
+        face_image = self.extract_face(frame, detection)
+        embedding, latency_ms = self.embed_face(face_image)
+        return EmbeddingResult(embedding, face_image, latency_ms)
 
     def warmup(self, runs: int = 2) -> list[float]:
         sample = np.zeros((112, 112, 3), dtype=np.uint8)
-        return [self.embed_aligned(sample)[1] for _ in range(runs)]
+        return [self.embed_face(sample)[1] for _ in range(runs)]

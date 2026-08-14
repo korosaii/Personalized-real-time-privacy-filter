@@ -24,7 +24,7 @@ class FaceQuality:
 
 
 def assess_face_quality(
-    aligned_face: np.ndarray,
+    face_image: np.ndarray,
     detection: np.ndarray,
     min_face_size: float = 96.0,
     min_sharpness: float = 25.0,
@@ -34,7 +34,7 @@ def assess_face_quality(
     width = max(0.0, float(detection[2] - detection[0]))
     height = max(0.0, float(detection[3] - detection[1]))
     face_size = min(width, height)
-    gray = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
     brightness = float(np.mean(gray))
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
@@ -93,9 +93,10 @@ def build_template(
     name: str,
     embeddings: list[np.ndarray] | np.ndarray,
     model_sha256: str,
-    threshold: float = 0.50,
+    threshold: float = 0.35,
     minimum_samples: int = 1,
     source: str = "unknown",
+    face_preprocessing: str = "unknown",
 ) -> EnrollmentTemplate:
     matrix = np.asarray(embeddings, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[1] != 512:
@@ -109,6 +110,7 @@ def build_template(
         "version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
+        "face_preprocessing": face_preprocessing,
         "samples": int(matrix.shape[0]),
         "genuine_score_min": round(float(scores.min()), 6),
         "genuine_score_mean": round(float(scores.mean()), 6),

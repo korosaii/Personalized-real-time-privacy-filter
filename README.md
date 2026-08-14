@@ -1,8 +1,8 @@
 # Personalized real-time privacy filter
 
-Real-time фильтр для камеры: зарегистрированный владелец остаётся видимым, остальные обнаруженные лица размываются.
+Real-time фильтр для камеры: зарегистрированный владелец остаётся видимым, остальные обнаруженные лица скрываются пикселизацией.
 
-Проект использует SCRFD-10G_KPS, iResNet-50/ArcFace, ONNX Runtime и OpenCV. Он работает на macOS и Windows. На Apple Silicon автоматически используется CoreML. На Windows автоматически используется DirectML с любой совместимой NVIDIA, AMD или Intel GPU, а при недоступности GPU — CPU.
+Проект использует YOLO11n-face, MobileFaceNet@WebFace600K, ONNX Runtime и OpenCV. Лендмарки и дополнительные landmark-модели не используются. На Apple Silicon автоматически используется CoreML. На Windows автоматически используется DirectML с совместимой NVIDIA, AMD или Intel GPU, а при недоступности GPU — CPU.
 
 ## Клонирование
 
@@ -47,12 +47,12 @@ python -m pip install -r requirements.txt
 ```text
 models/
 ├── detector/
-│   └── det_10g.onnx
+│   └── yolov11n-face.onnx
 └── recognition/
-    └── webface_r50.onnx
+    └── w600k_mbf.onnx
 ```
 
-Вручную преобразовывать модели не нужно. При первой команде программа автоматически создаст копии с фиксированными shapes внутри `.cache/models/`.
+Runtime использует статический YOLO11 ONNX с входом `640×640` и MobileFaceNet с входом `112×112`.
 
 
 ## Регистрация владельца
@@ -71,11 +71,15 @@ privacy-enroll owner data/photos/owner
 
 Biometric template сохраняется в `data/enrollments/owner.npz`. Исходные фотографии и enrollment data исключены из Git.
 
+Порог авторизации по умолчанию: `0.35`.
+
 ## Запуск
 
 ```bash
 privacy-recognize
 ```
+
+Лица с bbox меньше `80 px` остаются скрытыми и не отправляются в recognition. Перед первой проверкой лицо должно полностью находиться внутри кадра, а трек — быть стабильным три кадра. Новый подходящий трек проходит три проверки. После авторизации стабильный трек сохраняет состояние без постоянного recognition, в том числе при частичном выходе за край кадра. UNKNOWN проверяется повторно после роста на 15%, заметного перемещения в кадре или потери уверенности трекера. Авторизация сохраняется при уменьшении лица до `56 px`.
 
 Завершение: `Q`, `Esc` или `Ctrl+C`. Последний benchmark сохраняется локально в `benchmarks/latest.json`.
 

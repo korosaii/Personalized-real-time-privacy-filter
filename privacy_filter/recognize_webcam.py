@@ -17,15 +17,10 @@ from .camera import Camera
 from .enrollment import load_template, sha256_file
 from .model_setup import prepare_runtime_models
 from .ort_session import PROVIDER_CHOICES
-from .recognition import FaceEmbedder
-from .redaction import blur_faces, redact_entire_frame
-from .scrfd import SCRFDDetector
-from .tracking import (
-    FaceState,
-    FaceTrack,
-    FaceTracker,
-    recognition_interval_for_state,
-)
+from .recognition import FACE_PREPROCESSING, FaceEmbedder
+from .redaction import pixelate_faces, redact_entire_frame
+from .tracking import FaceState, FaceTrack, FaceTracker
+from .yolo import YOLOFaceDetector
 
 
 WINDOW_TITLE = "Personalized Privacy Filter (Q/Esc to quit)"
@@ -54,37 +49,53 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--camera-fps", type=float, default=30.0)
-    parser.add_argument("--blur-padding", type=float, default=0.18)
     parser.add_argument(
-        "--recognition-interval",
-        type=int,
-        default=3,
-        help="Recognize a single pending/unknown face every N frames",
+        "--redaction-padding",
+        "--blur-padding",
+        dest="redaction_padding",
+        type=float,
+        default=0.18,
     )
     parser.add_argument(
         "--authorized-recheck-interval",
         type=int,
-        default=2,
-        help="Recheck an authorized single face every N frames",
+        default=300,
+        help="Safety recheck for a stable authorized track in frames; 0 disables it",
     )
     parser.add_argument(
-        "--crowded-unknown-interval",
-        type=int,
-        default=5,
-        help="Recheck an already rejected track every N crowded frames",
+        "--minimum-recognition-face-size",
+        type=float,
+        default=80.0,
+        help="Minimum bbox side in pixels before recognition is attempted",
     )
+    parser.add_argument(
+        "--minimum-authorized-face-size",
+        type=float,
+        default=56.0,
+        help="Minimum bbox side in pixels for keeping an authorized track visible",
+    )
+    parser.add_argument(
+        "--unknown-retry-growth",
+        type=float,
+        default=1.15,
+        help="Retry UNKNOWN only after its face bbox grows by this factor",
+    )
+    parser.add_argument(
+        "--unknown-retry-movement",
+        type=float,
+        default=0.35,
+        help="Retry UNKNOWN after center movement relative to the previous face size",
+    )
+    parser.add_argument("--unknown-retry-cooldown", type=int, default=5)
+    parser.add_argument("--recognition-stable-frames", type=int, default=3)
+    parser.add_argument("--recognition-edge-margin", type=float, default=0.05)
     parser.add_argument(
         "--confirmations",
         type=int,
         default=3,
         help="Consecutive positive recognition checks required before reveal",
     )
-    parser.add_argument(
-        "--authorization-ttl",
-        type=int,
-        default=4,
-        help="Maximum frames since the last positive check",
-    )
+    parser.add_argument("--detector-threshold", type=float, default=0.25)
     parser.add_argument("--track-iou-threshold", type=float, default=0.25)
     parser.add_argument("--authorization-iou-threshold", type=float, default=0.40)
     parser.add_argument("--track-max-missed", type=int, default=8)
@@ -107,7 +118,66 @@ def _distribution(values: list[float]) -> dict[str, float] | None:
     }
 
 
-def _draw_label(frame: np.ndarray, track: FaceTrack, identity: str, confirmations: int) -> None:
+def _is_near_frame_edge(
+    track: FaceTrack,
+    frame_width: int,
+    frame_height: int,
+    edge_margin_ratio: float,
+) -> bool:
+    detection = track.detection
+    margin = max(2.0, track.face_size * edge_margin_ratio)
+    return bool(
+        detection[0] <= margin
+        or detection[1] <= margin
+        or frame_width - detection[2] <= margin
+        or frame_height - detection[3] <= margin
+    )
+
+
+def _recognition_gate(
+    track: FaceTrack,
+    frame_width: int,
+    frame_height: int,
+    minimum_face_size: float,
+    stable_frames: int,
+    edge_margin_ratio: float,
+) -> str | None:
+    if track.overlap_uncertain:
+        return "overlap_uncertain"
+    if _is_near_frame_edge(
+        track,
+        frame_width,
+        frame_height,
+        edge_margin_ratio,
+    ):
+        return "face_near_frame_edge"
+    if track.face_size < minimum_face_size:
+        return "face_too_small"
+    required_matches = max(0, stable_frames - 1)
+    if not track.tracking_confident or track.stable_matches < required_matches:
+        return "track_stabilizing"
+    return None
+
+
+def _authorization_size_requires_revoke(
+    track: FaceTrack,
+    minimum_authorized_face_size: float,
+    near_frame_edge: bool,
+) -> bool:
+    return (
+        track.authorized
+        and track.face_size < minimum_authorized_face_size
+        and not near_frame_edge
+    )
+
+
+def _draw_label(
+    frame: np.ndarray,
+    track: FaceTrack,
+    identity: str,
+    confirmations: int,
+    minimum_face_size: float,
+) -> None:
     detection = track.detection
     height, width = frame.shape[:2]
     x1 = max(0, min(width - 1, int(detection[0])))
@@ -117,6 +187,18 @@ def _draw_label(frame: np.ndarray, track: FaceTrack, identity: str, confirmation
     if track.state is FaceState.AUTHORIZED:
         color = (70, 230, 70)
         label = f"#{track.track_id} {identity}"
+    elif track.recognition_block_reason == "face_near_frame_edge":
+        color = (40, 210, 255)
+        label = f"#{track.track_id} WAIT FULL FACE"
+    elif track.recognition_block_reason == "track_stabilizing":
+        color = (40, 210, 255)
+        label = f"#{track.track_id} STABILIZING"
+    elif track.overlap_uncertain:
+        color = (40, 70, 255)
+        label = f"#{track.track_id} TRACK UNCERTAIN"
+    elif track.face_size < minimum_face_size:
+        color = (40, 210, 255)
+        label = f"#{track.track_id} TOO SMALL {track.face_size:.0f}px"
     elif track.state is FaceState.PENDING:
         color = (40, 210, 255)
         label = f"#{track.track_id} PENDING {track.positive_streak}/{confirmations}"
@@ -140,8 +222,8 @@ def _draw_metrics(
     visible_tracks: int,
     threshold: float,
     confirmations: int,
-    interval: int,
     authorized_interval: int,
+    minimum_face_size: float,
 ) -> None:
     fps = 1000.0 / float(np.mean(rolling_ms)) if rolling_ms else 0.0
     lines = (
@@ -149,7 +231,8 @@ def _draw_metrics(
         f"Detector {detector_ms:5.1f} ms  Recognition {recognition_ms:5.1f} ms ({recognition_calls} calls)",
         (
             f"Tracks {visible_tracks}  threshold {threshold:.3f}  "
-            f"confirm {confirmations}  intervals {interval}/{authorized_interval}"
+            f"confirm {confirmations}  min-face {minimum_face_size:.0f}px  "
+            f"recheck {authorized_interval}"
         ),
     )
     y = 28
@@ -162,18 +245,29 @@ def _draw_metrics(
 def _validate_args(args: argparse.Namespace, threshold: float) -> None:
     if not 0.0 < threshold < 1.0:
         raise ValueError("Authorization threshold must be between 0 and 1")
-    if args.recognition_interval < 1:
-        raise ValueError("--recognition-interval must be at least 1")
-    if args.authorized_recheck_interval < 1:
-        raise ValueError("--authorized-recheck-interval must be at least 1")
-    if args.crowded_unknown_interval < 1:
-        raise ValueError("--crowded-unknown-interval must be at least 1")
+    if args.authorized_recheck_interval < 0:
+        raise ValueError("--authorized-recheck-interval cannot be negative")
+    if args.minimum_recognition_face_size <= 0:
+        raise ValueError("--minimum-recognition-face-size must be positive")
+    if not 0 < args.minimum_authorized_face_size <= args.minimum_recognition_face_size:
+        raise ValueError(
+            "--minimum-authorized-face-size must be positive and no greater than "
+            "--minimum-recognition-face-size"
+        )
+    if args.unknown_retry_growth <= 1.0:
+        raise ValueError("--unknown-retry-growth must be greater than 1")
+    if args.unknown_retry_movement <= 0:
+        raise ValueError("--unknown-retry-movement must be positive")
+    if args.unknown_retry_cooldown < 1:
+        raise ValueError("--unknown-retry-cooldown must be at least 1")
+    if args.recognition_stable_frames < 1:
+        raise ValueError("--recognition-stable-frames must be at least 1")
+    if not 0.0 <= args.recognition_edge_margin < 0.5:
+        raise ValueError("--recognition-edge-margin must be between 0 and 0.5")
+    if not 0.0 < args.detector_threshold < 1.0:
+        raise ValueError("--detector-threshold must be between 0 and 1")
     if args.confirmations < 1:
         raise ValueError("--confirmations must be at least 1")
-    if args.authorization_ttl < args.authorized_recheck_interval:
-        raise ValueError(
-            "--authorization-ttl must be at least --authorized-recheck-interval"
-        )
     if args.track_max_missed < 0:
         raise ValueError("--track-max-missed cannot be negative")
 
@@ -199,13 +293,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "Enrollment was created with a different recognition model. "
             "Re-run privacy-enroll with the current model."
         )
+    if template.metadata.get("face_preprocessing") != FACE_PREPROCESSING:
+        raise ValueError(
+            "Enrollment was created with another face crop policy. "
+            "Re-run privacy-enroll for bbox-only recognition."
+        )
     threshold = template.threshold if args.threshold is None else args.threshold
     _validate_args(args, threshold)
 
-    detector = SCRFDDetector(
+    detector = YOLOFaceDetector(
         models.detector_runtime,
-        input_size=(512, 512),
-        threshold=0.40,
+        threshold=args.detector_threshold,
         provider=args.provider,
     )
     embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
@@ -214,7 +312,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         max_missed_frames=args.track_max_missed,
         authorization_iou_threshold=args.authorization_iou_threshold,
     )
-    blank = np.zeros((512, 512, 3), dtype=np.uint8)
+    blank = np.zeros((detector.input_size[1], detector.input_size[0], 3), dtype=np.uint8)
     detector.detect(blank)
     detector.detect(blank)
     recognition_warmup = embedder.warmup(2)
@@ -228,17 +326,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             print(f"Provider warning: {warning}", file=sys.stderr)
     print(f"Recognition warmup: {[round(value, 2) for value in recognition_warmup]} ms")
     print(
-        f"Safe state: {args.confirmations} confirmations, recognition every "
-        f"{args.recognition_interval} frames while blurred, recheck every "
-        f"{args.authorized_recheck_interval} frames after reveal, authorization TTL "
-        f"{args.authorization_ttl} frames."
+        f"Event recognition: minimum face {args.minimum_recognition_face_size:.0f}px, "
+        f"{args.recognition_stable_frames} stable frames, {args.confirmations} "
+        "confirmations."
     )
     print(
-        "Crowded schedule: AUTHORIZED/PENDING every frame, confirmed UNKNOWN every "
-        f"{args.crowded_unknown_interval} frames."
+        f"UNKNOWN retry: {args.unknown_retry_growth:.2f}x growth or "
+        f"{args.unknown_retry_movement:.2f}x movement after "
+        f"{args.unknown_retry_cooldown} frames."
+    )
+    print(
+        f"Stable AUTHORIZED tracks are rechecked every {args.authorized_recheck_interval} "
+        "frames and immediately hidden when tracking becomes uncertain."
     )
     print("Pipeline: camera/UI on main thread, inference on one worker, queue depth 1.")
-    print("Privacy rule: PENDING, UNKNOWN, stale, lost, or failed recognition => blurred.")
+    print("Privacy rule: PENDING, UNKNOWN, stale, lost, or failed recognition => pixelated.")
 
     camera = Camera(args.camera, args.width, args.height, args.camera_fps)
     print(
@@ -261,6 +363,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_calls = 0
     recognition_skips = 0
     recognition_failures = 0
+    recognition_reasons: dict[str, int] = {}
+    recognition_skip_reasons: dict[str, int] = {}
     authorization_grants = 0
     state_revocations = 0
     authorized_observations = 0
@@ -284,35 +388,69 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         try:
             detected = detector.detect(frame)
             detector_ms = detected.latency_ms
-            visible_tracks = tracker.update(
-                detected.detections,
-                detected.keypoints,
-                frame_index,
-            )
+            visible_tracks = tracker.update(detected.detections, frame_index)
             if len(visible_tracks) > 1:
                 crowded_frames += 1
 
+            frame_height, frame_width = frame.shape[:2]
             for track in visible_tracks:
-                if track.expire_authorization(frame_index, args.authorization_ttl):
-                    state_revocations += 1
-                recognition_interval = recognition_interval_for_state(
-                    track.state,
-                    len(visible_tracks),
-                    args.recognition_interval,
-                    args.authorized_recheck_interval,
-                    args.crowded_unknown_interval,
+                near_frame_edge = _is_near_frame_edge(
+                    track,
+                    frame_width,
+                    frame_height,
+                    args.recognition_edge_margin,
                 )
-                if not track.should_recognize(frame_index, recognition_interval):
+                if (
+                    _authorization_size_requires_revoke(
+                        track,
+                        args.minimum_authorized_face_size,
+                        near_frame_edge,
+                    )
+                    and track.mark_uncertain()
+                ):
+                    state_revocations += 1
+                gate_reason = _recognition_gate(
+                    track,
+                    frame_width,
+                    frame_height,
+                    args.minimum_recognition_face_size,
+                    args.recognition_stable_frames,
+                    args.recognition_edge_margin,
+                )
+                track.recognition_block_reason = gate_reason
+                if gate_reason is not None:
                     recognition_skips += 1
+                    recognition_skip_reasons[gate_reason] = (
+                        recognition_skip_reasons.get(gate_reason, 0) + 1
+                    )
+                    continue
+                recognition_reason = track.recognition_reason(
+                    frame_index,
+                    args.minimum_recognition_face_size,
+                    args.unknown_retry_growth,
+                    args.unknown_retry_movement,
+                    args.unknown_retry_cooldown,
+                    args.authorized_recheck_interval,
+                )
+                if recognition_reason is None:
+                    recognition_skips += 1
+                    if track.state is FaceState.UNKNOWN:
+                        skip_reason = "unknown_waiting_for_change"
+                    else:
+                        skip_reason = "stable_track"
+                    recognition_skip_reasons[skip_reason] = (
+                        recognition_skip_reasons.get(skip_reason, 0) + 1
+                    )
                     continue
 
                 recognition_calls += 1
+                recognition_reasons[recognition_reason] = (
+                    recognition_reasons.get(recognition_reason, 0) + 1
+                )
                 frame_recognition_calls += 1
                 score: float | None = None
                 try:
-                    if track.keypoints is None:
-                        raise ValueError("Missing five-point landmarks")
-                    result = embedder.embed(frame, track.keypoints)
+                    result = embedder.embed_bbox(frame, track.detection)
                     recognition_ms += result.latency_ms
                     recognition_call_latencies.append(result.latency_ms)
                     score = template.score(result.embedding)
@@ -342,7 +480,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 track.detection for track in visible_tracks if not track.authorized
             ]
             output = (
-                blur_faces(frame, np.asarray(unauthorized), padding=args.blur_padding)
+                pixelate_faces(
+                    frame,
+                    np.asarray(unauthorized),
+                    padding=args.redaction_padding,
+                )
                 if unauthorized
                 else frame.copy()
             )
@@ -371,7 +513,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 pending_observations += 1
             else:
                 unknown_observations += 1
-            _draw_label(output, track, template.name, args.confirmations)
+            _draw_label(
+                output,
+                track,
+                template.name,
+                args.confirmations,
+                args.minimum_recognition_face_size,
+            )
 
         processing_ms = (perf_counter() - processing_started) * 1000.0
         detector_latencies.append(detector_ms)
@@ -418,8 +566,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 processed.visible_tracks,
                 threshold,
                 args.confirmations,
-                args.recognition_interval,
                 args.authorized_recheck_interval,
+                args.minimum_recognition_face_size,
             )
             cv2.imshow(WINDOW_TITLE, processed.output)
             key = cv2.waitKey(1) & 0xFF
@@ -448,21 +596,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 1,
+        "pipeline_version": 5,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "settings": {
             "threshold": threshold,
             "confirmations": args.confirmations,
-            "recognition_interval": args.recognition_interval,
             "authorized_recheck_interval": args.authorized_recheck_interval,
-            "crowded_pending_interval": 1,
-            "crowded_authorized_interval": 1,
-            "crowded_unknown_interval": args.crowded_unknown_interval,
-            "authorization_ttl": args.authorization_ttl,
+            "minimum_recognition_face_size": args.minimum_recognition_face_size,
+            "minimum_authorized_face_size": args.minimum_authorized_face_size,
+            "unknown_retry_growth": args.unknown_retry_growth,
+            "unknown_retry_movement": args.unknown_retry_movement,
+            "unknown_retry_cooldown": args.unknown_retry_cooldown,
+            "recognition_stable_frames": args.recognition_stable_frames,
+            "recognition_edge_margin": args.recognition_edge_margin,
+            "detector_threshold": args.detector_threshold,
             "track_iou_threshold": args.track_iou_threshold,
             "authorization_iou_threshold": args.authorization_iou_threshold,
             "track_max_missed": args.track_max_missed,
+            "redaction_padding": args.redaction_padding,
+            "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
+            "face_preprocessing": FACE_PREPROCESSING,
             "pipeline": "main-thread-camera_single-worker-inference",
             "pipeline_queue_depth": 1,
         },
@@ -495,6 +649,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "recognition_calls": recognition_calls,
         "recognition_skips": recognition_skips,
         "recognition_failures": recognition_failures,
+        "recognition_reasons": recognition_reasons,
+        "recognition_skip_reasons": recognition_skip_reasons,
         "crowded_frames": crowded_frames,
         "state_observations": {
             "authorized": authorized_observations,
