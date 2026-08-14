@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--camera-fps", type=float, default=30.0)
     parser.add_argument(
+        "--mirror",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mirror the camera preview; enabled by default",
+    )
+    parser.add_argument(
         "--redaction-padding",
         "--blur-padding",
         dest="redaction_padding",
@@ -135,6 +141,13 @@ def _is_near_frame_edge(
         or frame_width - detection[2] <= margin
         or frame_height - detection[3] <= margin
     )
+
+
+def _unmirror_detection(detection: np.ndarray, frame_width: int) -> np.ndarray:
+    restored = np.asarray(detection, dtype=np.float32).copy()
+    restored[0] = frame_width - detection[2]
+    restored[2] = frame_width - detection[0]
+    return restored
 
 
 def _recognition_gate(
@@ -351,6 +364,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         f"Camera: {camera.info.width}x{camera.info.height} at reported "
         f"{camera.info.fps:.1f} FPS ({camera.info.backend})"
     )
+    print(f"Camera mirror: {'enabled' if args.mirror else 'disabled'}")
     started = perf_counter()
     rolling_ms: deque[float] = deque(maxlen=120)
     detector_latencies: list[float] = []
@@ -385,6 +399,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         nonlocal crowded_frames
 
         processing_started = perf_counter()
+        recognition_frame = frame
+        if args.mirror:
+            frame = cv2.flip(frame, 1)
         detector_ms = 0.0
         recognition_ms = 0.0
         frame_recognition_calls = 0
@@ -454,7 +471,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 frame_recognition_calls += 1
                 score: float | None = None
                 try:
-                    result = embedder.embed_bbox(frame, track.detection)
+                    recognition_detection = (
+                        _unmirror_detection(track.detection, frame_width)
+                        if args.mirror
+                        else track.detection
+                    )
+                    result = embedder.embed_bbox(
+                        recognition_frame,
+                        recognition_detection,
+                    )
                     recognition_ms += result.latency_ms
                     recognition_call_latencies.append(result.latency_ms)
                     score = template.score(result.embedding)
@@ -600,7 +625,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 5,
+        "pipeline_version": 6,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "settings": {
@@ -619,6 +644,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "authorization_iou_threshold": args.authorization_iou_threshold,
             "track_max_missed": args.track_max_missed,
             "redaction_padding": args.redaction_padding,
+            "mirror": args.mirror,
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
             "face_preprocessing": FACE_PREPROCESSING,
             "pipeline": "main-thread-camera_single-worker-inference",
