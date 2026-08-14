@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Build owner template",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "privacy_filter.enroll_cli",
+      "console": "integratedTerminal",
+      "args": [
+        "owner",
+        "${workspaceFolder}/data/photos/owner"
+      ]
+    },
+    {
+      "name": "Run personalized privacy filter",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "privacy_filter.recognize_webcam",
+      "console": "integratedTerminal",
+      "args": [
+        "--template",
+        "data/enrollments/owner.npz"
+      ]
+    }
+  ]
+}

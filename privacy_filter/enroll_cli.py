@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+
+from .enrollment import (
+    assess_face_quality,
+    build_template,
+    safe_identity_name,
+    save_template,
+    sha256_file,
+)
+from .recognition import FaceEmbedder
+from .scrfd import SCRFDDetector
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build a local biometric template from owner photographs."
+    )
+    parser.add_argument("name", help="Local identity name, for example owner")
+    parser.add_argument(
+        "photos",
+        nargs="+",
+        type=Path,
+        help="Photographs or folders containing photographs",
+    )
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--detector-model", default="models/detector/det_10g_512.onnx")
+    parser.add_argument("--recognition-model", default="models/recognition/webface_r50_112.onnx")
+    parser.add_argument("--provider", choices=("auto", "cpu", "coreml"), default="auto")
+    parser.add_argument("--threshold", type=float, default=0.50)
+    parser.add_argument("--min-face-size", type=float, default=96.0)
+    parser.add_argument("--min-sharpness", type=float, default=25.0)
+    return parser
+
+
+def expand_photos(paths: list[Path]) -> list[Path]:
+    discovered: list[Path] = []
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved.is_dir():
+            discovered.extend(
+                item.resolve()
+                for item in sorted(resolved.rglob("*"))
+                if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS
+            )
+        elif resolved.is_file() and resolved.suffix.lower() in IMAGE_EXTENSIONS:
+            discovered.append(resolved)
+        elif resolved.is_file():
+            print(f"Skipped unsupported file type: {resolved.name}", file=sys.stderr)
+        else:
+            print(f"Skipped missing path: {resolved}", file=sys.stderr)
+
+    return list(dict.fromkeys(discovered))
+
+
+def load_models(args: argparse.Namespace) -> tuple[SCRFDDetector, FaceEmbedder]:
+    detector = SCRFDDetector(
+        args.detector_model,
+        input_size=(512, 512),
+        threshold=0.50,
+        provider=args.provider,
+    )
+    embedder = FaceEmbedder(args.recognition_model, provider=args.provider)
+    blank = np.zeros((512, 512, 3), dtype=np.uint8)
+    detector.detect(blank)
+    detector.detect(blank)
+    embedder.warmup(2)
+    print(f"Detector providers: {detector.providers}")
+    print(f"Recognition providers: {embedder.providers}")
+    return detector, embedder
+
+
+def embedding_from_photo(
+    path: Path,
+    detector: SCRFDDetector,
+    embedder: FaceEmbedder,
+    min_face_size: float,
+    min_sharpness: float,
+) -> tuple[np.ndarray | None, str]:
+    photo = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if photo is None:
+        return None, "could not decode the image"
+
+    detected = detector.detect(photo)
+    face_count = len(detected.detections)
+    if face_count != 1:
+        return None, f"expected exactly one face, found {face_count}"
+    if detected.keypoints is None or len(detected.keypoints) != 1:
+        return None, "five facial keypoints are unavailable"
+
+    embedded = embedder.embed(photo, detected.keypoints[0])
+    quality = assess_face_quality(
+        embedded.aligned_face,
+        detected.detections[0],
+        min_face_size=min_face_size,
+        min_sharpness=min_sharpness,
+    )
+    if not quality.accepted:
+        return None, quality.reason
+    return embedded.embedding, "accepted"
+
+
+def is_new_sample(candidate: np.ndarray, accepted: list[np.ndarray]) -> bool:
+    if not accepted:
+        return True
+    similarities = np.asarray(accepted, dtype=np.float32) @ candidate
+    return float(similarities.max()) < 0.9999
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if not 0.0 < args.threshold < 1.0:
+        raise SystemExit("--threshold must be between 0 and 1")
+    photos = expand_photos(args.photos)
+    if not photos:
+        raise SystemExit(
+            "No supported photographs found. Use JPG, JPEG, PNG, WEBP, BMP, TIFF, "
+            "or a folder containing those files."
+        )
+    print(f"Found {len(photos)} photograph(s). Raw photos will not be copied.")
+
+    detector, embedder = load_models(args)
+    accepted: list[np.ndarray] = []
+    rejected = 0
+    for path in photos:
+        embedding, reason = embedding_from_photo(
+            path,
+            detector,
+            embedder,
+            args.min_face_size,
+            args.min_sharpness,
+        )
+        if embedding is None:
+            rejected += 1
+            print(f"REJECTED  {path.name}: {reason}")
+            continue
+        if not is_new_sample(embedding, accepted):
+            rejected += 1
+            print(f"REJECTED  {path.name}: duplicate or nearly identical photo")
+            continue
+        accepted.append(embedding)
+        print(f"ACCEPTED  {path.name}: {len(accepted)}")
+
+    if not accepted:
+        raise SystemExit(
+            "No suitable owner face was found. Add at least one clear photograph "
+            "containing exactly one visible face."
+        )
+
+    safe_name = safe_identity_name(args.name)
+    output = args.output or Path("data/enrollments") / f"{safe_name}.npz"
+    template = build_template(
+        safe_name,
+        accepted,
+        model_sha256=sha256_file(args.recognition_model),
+        threshold=args.threshold,
+        source="photos",
+    )
+    saved = save_template(template, output)
+    scores = template.genuine_scores
+    print()
+    print(f"Template saved: {saved}")
+    print(f"Accepted photos: {len(accepted)}; rejected: {rejected}")
+    print(
+        "Genuine scores to centroid: "
+        f"min={scores.min():.3f}, mean={scores.mean():.3f}, max={scores.max():.3f}"
+    )
+    print(f"Initial authorization threshold: {template.threshold:.3f}")
+    print("No source photograph was copied into the template.")
+    if len(accepted) == 1:
+        print(
+            "Warning: the template contains one photo. It will work, but additional "
+            "poses and lighting conditions usually improve recognition stability."
+        )
+
+
+if __name__ == "__main__":
+    main()
