@@ -48,6 +48,13 @@ class FaceTrack:
     stable_matches: int = 0
     overlap_uncertain: bool = False
     recognition_block_reason: str | None = None
+    lighting_mode: str = "UNKNOWN"
+    lighting_ambient_median: float | None = None
+    lighting_face_p10: float | None = None
+    lighting_face_p90: float | None = None
+    lighting_face_black_ratio: float | None = None
+    lighting_face_white_ratio: float | None = None
+    lighting_effective_threshold: float | None = None
     velocity: np.ndarray = field(
         default_factory=lambda: np.zeros(4, dtype=np.float32)
     )

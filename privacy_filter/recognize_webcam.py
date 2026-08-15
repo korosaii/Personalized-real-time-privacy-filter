@@ -15,6 +15,7 @@ import numpy as np
 
 from .camera import Camera
 from .enrollment import load_template, sha256_file
+from .lighting import LightingMode, classify_lighting, measure_lighting
 from .model_setup import prepare_runtime_models
 from .ort_session import PROVIDER_CHOICES
 from .recognition import FACE_PREPROCESSING, FaceEmbedder
@@ -24,6 +25,11 @@ from .yolo import YOLOFaceDetector
 
 
 WINDOW_TITLE = "Personalized Privacy Filter (Q/Esc to quit)"
+LIGHTING_SEVERITY = {
+    LightingMode.NORMAL.value: 0,
+    LightingMode.LOW_LIGHT.value: 1,
+    LightingMode.OVEREXPOSED.value: 1,
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class ProcessedFrame:
     recognition_ms: float
     recognition_calls: int
     visible_tracks: int
+    lighting_modes: tuple[str, ...]
     processing_ms: float
 
 
@@ -54,13 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Mirror the camera preview; enabled by default",
-    )
-    parser.add_argument(
-        "--redaction-padding",
-        "--blur-padding",
-        dest="redaction_padding",
-        type=float,
-        default=0.18,
     )
     parser.add_argument(
         "--authorized-recheck-interval",
@@ -105,6 +105,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consecutive positive recognition checks required before reveal",
     )
     parser.add_argument("--detector-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--lighting-padding",
+        type=float,
+        default=0.25,
+        help="Padding around the face bbox used as an ambient-light ring",
+    )
+    parser.add_argument(
+        "--lighting-ema-alpha",
+        type=float,
+        default=0.20,
+        help="EMA weight for current-frame lighting measurements",
+    )
+    parser.add_argument(
+        "--low-light-threshold",
+        type=float,
+        default=0.30,
+        help="Authorization threshold used in LOW_LIGHT and OVEREXPOSED",
+    )
     parser.add_argument("--track-iou-threshold", type=float, default=0.25)
     parser.add_argument("--authorization-iou-threshold", type=float, default=0.40)
     parser.add_argument("--track-max-missed", type=int, default=8)
@@ -125,6 +143,10 @@ def _distribution(values: list[float]) -> dict[str, float] | None:
         "min": round(float(array.min()), 3),
         "max": round(float(array.max()), 3),
     }
+
+
+def _update_ema(previous: float | None, current: float, alpha: float) -> float:
+    return current if previous is None else (1.0 - alpha) * previous + alpha * current
 
 
 def _is_near_frame_edge(
@@ -236,12 +258,16 @@ def _draw_metrics(
     recognition_ms: float,
     recognition_calls: int,
     visible_tracks: int,
+    lighting_modes: tuple[str, ...],
     threshold: float,
     confirmations: int,
     authorized_interval: int,
     minimum_face_size: float,
 ) -> None:
     fps = 1000.0 / float(np.mean(rolling_ms)) if rolling_ms else 0.0
+    lighting_counts = {
+        mode.value: lighting_modes.count(mode.value) for mode in LightingMode
+    }
     lines = (
         f"FPS {fps:5.1f}",
         f"Detector {detector_ms:5.1f} ms  Recognition {recognition_ms:5.1f} ms ({recognition_calls} calls)",
@@ -249,6 +275,12 @@ def _draw_metrics(
             f"Tracks {visible_tracks}  threshold {threshold:.3f}  "
             f"confirm {confirmations}  min-face {minimum_face_size:.0f}px  "
             f"recheck {authorized_interval}"
+        ),
+        (
+            "Lighting "
+            f"NORMAL:{lighting_counts[LightingMode.NORMAL.value]}  "
+            f"LOW_LIGHT:{lighting_counts[LightingMode.LOW_LIGHT.value]}  "
+            f"OVEREXPOSED:{lighting_counts[LightingMode.OVEREXPOSED.value]}"
         ),
     )
     y = 28
@@ -263,6 +295,12 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
         raise ValueError("Authorization threshold must be between 0 and 1")
     if args.authorized_recheck_interval < 0:
         raise ValueError("--authorized-recheck-interval cannot be negative")
+    if args.lighting_padding <= 0.0:
+        raise ValueError("--lighting-padding must be positive")
+    if not 0.0 < args.lighting_ema_alpha <= 1.0:
+        raise ValueError("--lighting-ema-alpha must be in (0, 1]")
+    if not 0.0 < args.low_light_threshold < 1.0:
+        raise ValueError("--low-light-threshold must be between 0 and 1")
     if args.minimum_recognition_face_size <= 0:
         raise ValueError("--minimum-recognition-face-size must be positive")
     if not 0 < args.minimum_authorized_face_size <= args.minimum_recognition_face_size:
@@ -383,6 +421,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_failures = 0
     recognition_reasons: dict[str, int] = {}
     recognition_skip_reasons: dict[str, int] = {}
+    lighting_mode_observations: dict[str, int] = {}
     authorization_grants = 0
     state_revocations = 0
     authorized_observations = 0
@@ -396,7 +435,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         nonlocal recognition_calls, recognition_skips, recognition_failures
         nonlocal authorization_grants, state_revocations
         nonlocal authorized_observations, pending_observations, unknown_observations
-        nonlocal crowded_frames
+        nonlocal crowded_frames, lighting_mode_observations
 
         processing_started = perf_counter()
         recognition_frame = frame
@@ -415,6 +454,63 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
             frame_height, frame_width = frame.shape[:2]
             for track in visible_tracks:
+                lighting = measure_lighting(
+                    frame,
+                    track.detection,
+                    padding=args.lighting_padding,
+                )
+                previous_lighting_mode = track.lighting_mode
+                track.lighting_ambient_median = _update_ema(
+                    track.lighting_ambient_median,
+                    lighting.ambient_median,
+                    args.lighting_ema_alpha,
+                )
+                track.lighting_face_p90 = _update_ema(
+                    track.lighting_face_p90,
+                    lighting.face_p90,
+                    args.lighting_ema_alpha,
+                )
+                track.lighting_face_p10 = _update_ema(
+                    track.lighting_face_p10,
+                    lighting.face_p10,
+                    args.lighting_ema_alpha,
+                )
+                track.lighting_face_black_ratio = _update_ema(
+                    track.lighting_face_black_ratio,
+                    lighting.face_black_ratio,
+                    args.lighting_ema_alpha,
+                )
+                track.lighting_face_white_ratio = _update_ema(
+                    track.lighting_face_white_ratio,
+                    lighting.face_white_ratio,
+                    args.lighting_ema_alpha,
+                )
+                lighting_mode = classify_lighting(
+                    track.lighting_ambient_median,
+                    track.lighting_face_p10,
+                    track.lighting_face_p90,
+                    track.lighting_face_black_ratio,
+                    track.lighting_face_white_ratio,
+                )
+                track.lighting_mode = lighting_mode.value
+                lighting_mode_observations[lighting_mode.value] = (
+                    lighting_mode_observations.get(lighting_mode.value, 0) + 1
+                )
+                effective_threshold = threshold
+                if lighting_mode is not LightingMode.NORMAL:
+                    effective_threshold = args.low_light_threshold
+                track.lighting_effective_threshold = effective_threshold
+
+                if previous_lighting_mode not in ("UNKNOWN", lighting_mode.value):
+                    if (
+                        LIGHTING_SEVERITY[lighting_mode.value]
+                        > LIGHTING_SEVERITY[previous_lighting_mode]
+                    ):
+                        if track.mark_uncertain():
+                            state_revocations += 1
+                    else:
+                        track.verification_required = True
+
                 near_frame_edge = _is_near_frame_edge(
                     track,
                     frame_width,
@@ -483,7 +579,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     recognition_ms += result.latency_ms
                     recognition_call_latencies.append(result.latency_ms)
                     score = template.score(result.embedding)
-                    if score >= threshold:
+                    if score >= effective_threshold:
                         positive_scores.append(score)
                     else:
                         negative_scores.append(score)
@@ -496,7 +592,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
                 previous, current = track.record_recognition(
                     score,
-                    threshold,
+                    effective_threshold,
                     args.confirmations,
                     frame_index,
                 )
@@ -509,11 +605,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 track.detection for track in visible_tracks if not track.authorized
             ]
             output = (
-                pixelate_faces(
-                    frame,
-                    np.asarray(unauthorized),
-                    padding=args.redaction_padding,
-                )
+                pixelate_faces(frame, np.asarray(unauthorized))
                 if unauthorized
                 else frame.copy()
             )
@@ -560,6 +652,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             recognition_ms=recognition_ms,
             recognition_calls=frame_recognition_calls,
             visible_tracks=len(visible_tracks),
+            lighting_modes=tuple(track.lighting_mode for track in visible_tracks),
             processing_ms=processing_ms,
         )
 
@@ -593,6 +686,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 processed.recognition_ms,
                 processed.recognition_calls,
                 processed.visible_tracks,
+                processed.lighting_modes,
                 threshold,
                 args.confirmations,
                 args.authorized_recheck_interval,
@@ -625,7 +719,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 6,
+        "pipeline_version": 7,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "settings": {
@@ -640,10 +734,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "recognition_stable_frames": args.recognition_stable_frames,
             "recognition_edge_margin": args.recognition_edge_margin,
             "detector_threshold": args.detector_threshold,
+            "lighting_padding": args.lighting_padding,
+            "lighting_ema_alpha": args.lighting_ema_alpha,
+            "low_light_threshold": args.low_light_threshold,
+            "lighting_policy": "padding-ring_face-information_adaptive-threshold",
             "track_iou_threshold": args.track_iou_threshold,
             "authorization_iou_threshold": args.authorization_iou_threshold,
             "track_max_missed": args.track_max_missed,
-            "redaction_padding": args.redaction_padding,
             "mirror": args.mirror,
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
             "face_preprocessing": FACE_PREPROCESSING,
@@ -681,6 +778,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "recognition_failures": recognition_failures,
         "recognition_reasons": recognition_reasons,
         "recognition_skip_reasons": recognition_skip_reasons,
+        "lighting_mode_observations": lighting_mode_observations,
         "crowded_frames": crowded_frames,
         "state_observations": {
             "authorized": authorized_observations,
