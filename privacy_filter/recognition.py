@@ -12,7 +12,7 @@ from .ort_session import create_inference_session
 
 
 FACE_PREPROCESSING = "bbox_square_1.20_v1"
-FACE_ROTATION_ANGLES = (0, 90, 180, 270)
+FACE_ROTATION_ANGLES = (0, 30, 90, 180, 270, 330)
 
 
 def rotate_face(face_image: np.ndarray, angle: int) -> np.ndarray:
@@ -26,6 +26,15 @@ def rotate_face(face_image: np.ndarray, angle: int) -> np.ndarray:
         return cv2.rotate(face_image, cv2.ROTATE_180)
     if angle == 270:
         return cv2.rotate(face_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if angle in (30, 330):
+        transform = cv2.getRotationMatrix2D((55.5, 55.5), angle, 1.0)
+        return cv2.warpAffine(
+            face_image,
+            transform,
+            (112, 112),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
     raise ValueError(f"Unsupported face rotation: {angle}")
 
 

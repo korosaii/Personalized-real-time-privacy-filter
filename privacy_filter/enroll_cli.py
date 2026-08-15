@@ -13,7 +13,7 @@ from .enrollment import (
     safe_identity_name,
     save_template,
 )
-from .model_setup import RuntimeModels, prepare_runtime_models
+from .model_setup import RuntimeModels, prepare_runtime_models, recognition_model_help
 from .ort_session import PROVIDER_CHOICES
 from .recognition import (
     FACE_PREPROCESSING,
@@ -40,9 +40,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--detector-model", type=Path, default=None)
-    parser.add_argument("--recognition-model", type=Path, default=None)
+    parser.add_argument(
+        "--recognition-model",
+        "--model",
+        default="r34-glint360k",
+        help=recognition_model_help(),
+    )
     parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
     parser.add_argument("--threshold", type=float, default=0.35)
+    parser.add_argument(
+        "--rotations",
+        action="store_true",
+        help="Add 30/90/180/270/330-degree enrollment rotations",
+    )
     parser.add_argument("--min-face-size", type=float, default=80.0)
     parser.add_argument("--min-sharpness", type=float, default=25.0)
     return parser
@@ -90,6 +100,7 @@ def load_models(
     detector.detect(blank)
     detector.detect(blank)
     embedder.warmup(2)
+    print(f"Recognition model: {models.recognition_name}")
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
     for warning in (detector.provider_warning, embedder.provider_warning):
@@ -104,6 +115,7 @@ def embedding_from_photo(
     embedder: FaceEmbedder,
     min_face_size: float,
     min_sharpness: float,
+    use_rotations: bool,
 ) -> tuple[np.ndarray | None, str]:
     photo = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if photo is None:
@@ -122,9 +134,10 @@ def embedding_from_photo(
     )
     if not quality.accepted:
         return None, quality.reason
+    rotation_angles = FACE_ROTATION_ANGLES if use_rotations else (0,)
     embeddings = [
         embedder.embed_face(rotate_face(face_image, angle))[0]
-        for angle in FACE_ROTATION_ANGLES
+        for angle in rotation_angles
     ]
     return np.stack(embeddings).astype(np.float32), "accepted"
 
@@ -132,11 +145,8 @@ def embedding_from_photo(
 def is_new_sample(candidate: np.ndarray, accepted: list[np.ndarray]) -> bool:
     if not accepted:
         return True
-    similarities = np.einsum(
-        "ad,nad->na",
-        np.asarray(candidate, dtype=np.float32),
-        np.asarray(accepted, dtype=np.float32),
-    )
+    accepted_upright = np.asarray(accepted, dtype=np.float32)[:, 0, :]
+    similarities = accepted_upright @ candidate[0]
     return float(similarities.max()) < 0.9999
 
 
@@ -162,6 +172,7 @@ def main() -> None:
             embedder,
             args.min_face_size,
             args.min_sharpness,
+            args.rotations,
         )
         if embedding is None:
             rejected += 1
@@ -189,17 +200,19 @@ def main() -> None:
         threshold=args.threshold,
         source="photos",
         face_preprocessing=FACE_PREPROCESSING,
+        rotation_angles=FACE_ROTATION_ANGLES if args.rotations else (0,),
     )
     saved = save_template(template, output)
-    scores = template.genuine_scores
     print()
     print(f"Template saved: {saved}")
     print(f"Accepted photos: {len(accepted)}; rejected: {rejected}")
+    rotation_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
     print(
-        "Genuine scores to rotation centroids: "
-        f"min={scores.min():.3f}, mean={scores.mean():.3f}, max={scores.max():.3f}"
+        f"Template embeddings: {len(template.embeddings)} "
+        f"({len(accepted)} photos x {len(rotation_angles)} orientation(s))"
     )
-    print(f"Rotation centroids: {list(template.rotation_angles)} degrees")
+    print(f"Rotation centroids: {len(template.rotation_centroids)}")
+    print(f"Rotation angles: {list(rotation_angles)} degrees")
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
     if len(accepted) == 1:

@@ -13,20 +13,29 @@ from .ort_session import preferred_execution_provider
 DETECTOR_CANDIDATES = (
     Path("models/detector/yolov11n-face.onnx"),
 )
-RECOGNITION_CANDIDATES = (
-    Path("models/recognition/w600k_mbf.onnx"),
-)
+RECOGNITION_MODEL_ALIASES = {
+    "r34-glint360k": Path("models/recognition/iresnet_r34_glint360k.onnx"),
+    "r100-glint360k": Path("models/recognition/iresnet_r100_glint360k.onnx"),
+    "r50-webface600k": Path("models/recognition/webface_r50.onnx"),
+}
+DEFAULT_RECOGNITION_MODEL = "r34-glint360k"
 
 
 @dataclass(frozen=True)
 class RuntimeModels:
     detector_source: Path
     recognition_source: Path
+    recognition_name: str
     detector_runtime: Path
     recognition_runtime: Path
     recognition_source_sha256: str
     preferred_execution_provider: str
     generated: tuple[Path, ...]
+
+
+def recognition_model_help() -> str:
+    aliases = ", ".join(RECOGNITION_MODEL_ALIASES)
+    return f"Recognition model alias ({aliases}) or path to an ONNX file"
 
 
 def _resolve_model(
@@ -45,6 +54,26 @@ def _resolve_model(
             return path
     expected = " or ".join(str(path) for path in candidates)
     raise FileNotFoundError(f"{label} ONNX model not found. Expected {expected}")
+
+
+def _resolve_recognition_model(
+    requested: str | Path | None,
+) -> tuple[Path, str]:
+    value = DEFAULT_RECOGNITION_MODEL if requested is None else str(requested)
+    if value in RECOGNITION_MODEL_ALIASES:
+        path = RECOGNITION_MODEL_ALIASES[value].expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Recognition model '{value}' not found: {path}"
+            )
+        return path, value
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        aliases = ", ".join(RECOGNITION_MODEL_ALIASES)
+        raise FileNotFoundError(
+            f"Recognition ONNX model not found: {path}. Available aliases: {aliases}"
+        )
+    return path, "custom"
 
 
 def _file_sha256(path: Path) -> str:
@@ -138,10 +167,8 @@ def prepare_runtime_models(
     cache_dir: str | Path = ".cache/models",
 ) -> RuntimeModels:
     detector_source = _resolve_model(detector_model, DETECTOR_CANDIDATES, "Detector")
-    recognition_source = _resolve_model(
-        recognition_model,
-        RECOGNITION_CANDIDATES,
-        "Recognition",
+    recognition_source, recognition_name = _resolve_recognition_model(
+        recognition_model
     )
     if detector_source.suffix.lower() != ".onnx":
         raise ValueError("Detector inference requires an ONNX model")
@@ -165,11 +192,12 @@ def prepare_runtime_models(
         if was_generated
     )
     return RuntimeModels(
-        detector_source,
-        recognition_source,
-        detector_runtime,
-        recognition_runtime,
-        recognition_source_sha256,
-        preferred_provider,
-        generated,
+        detector_source=detector_source,
+        recognition_source=recognition_source,
+        recognition_name=recognition_name,
+        detector_runtime=detector_runtime,
+        recognition_runtime=recognition_runtime,
+        recognition_source_sha256=recognition_source_sha256,
+        preferred_execution_provider=preferred_provider,
+        generated=generated,
     )
