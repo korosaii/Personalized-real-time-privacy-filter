@@ -238,6 +238,8 @@ def main() -> None:
             for index, angle in enumerate(template.rotation_angles)
         )
     )
+    print(f"Rotation centroids: {len(template.rotation_centroids)}")
+    print(f"Rotation angles: {list(rotation_angles)} degrees")
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
     if len(accepted) == 1:

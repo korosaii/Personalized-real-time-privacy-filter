@@ -22,3 +22,5 @@ data/photos/**
 !data/photos/
 !data/photos/owner/
 !data/photos/owner/.gitkeep
+
+*.mp4

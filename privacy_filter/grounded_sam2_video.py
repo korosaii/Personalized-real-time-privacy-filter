@@ -5,17 +5,74 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
-from typing import Any
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
 
-from .sam3_video import (
-    _clean_prompts,
-    _mask_path,
-    _merge_mask,
-    _pixelate_with_mask,
-)
+
+
+def _clean_prompts(prompt: str | Sequence[str]) -> tuple[str, ...]:
+    candidates = (prompt,) if isinstance(prompt, str) else tuple(prompt)
+    prompts: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        clean = candidate.strip()
+        if not clean:
+            raise ValueError("Grounded SAM 2 video prompts cannot be empty")
+        key = clean.casefold()
+        if key not in seen:
+            seen.add(key)
+            prompts.append(clean)
+    if not prompts:
+        raise ValueError("At least one Grounded SAM 2 video prompt is required")
+    return tuple(prompts)
+
+
+def _mask_path(mask_directory: Path, frame_index: int) -> Path:
+    return mask_directory / f"{frame_index:09d}.png"
+
+
+def _merge_mask(mask_path: Path, mask: np.ndarray) -> None:
+    merged = np.asarray(mask, dtype=bool)
+    if mask_path.exists():
+        existing = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if existing is None:
+            raise RuntimeError(f"Could not read temporary mask: {mask_path}")
+        if existing.shape != merged.shape:
+            raise RuntimeError(
+                f"Temporary mask shape {existing.shape} does not match {merged.shape}"
+            )
+        merged = np.logical_or(merged, existing > 0)
+    if not cv2.imwrite(str(mask_path), merged.astype(np.uint8) * 255):
+        raise RuntimeError(f"Could not write temporary mask: {mask_path}")
+
+
+def _pixelate_with_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    block_size: int,
+) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if mask.shape != (height, width):
+        raise ValueError(
+            f"Pixelation mask shape {mask.shape} does not match frame {(height, width)}"
+        )
+    if not bool(mask.any()):
+        return frame.copy()
+    reduced = cv2.resize(
+        frame,
+        (max(1, width // block_size), max(1, height // block_size)),
+        interpolation=cv2.INTER_AREA,
+    )
+    pixelated = cv2.resize(
+        reduced,
+        (width, height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    output = frame.copy()
+    output[mask] = pixelated[mask]
+    return output
 
 
 def _to_device(batch: Any, device: str) -> Any:
