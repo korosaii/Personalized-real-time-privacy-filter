@@ -14,7 +14,7 @@ DETECTOR_CANDIDATES = (
     Path("models/detector/yolov11n-face.onnx"),
 )
 RECOGNITION_CANDIDATES = (
-    Path("models/recognition/w600k_mbf.onnx"),
+    Path("models/recognition/glintr100.onnx"),
 )
 
 

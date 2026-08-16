@@ -90,8 +90,17 @@ class EnrollmentTemplate:
     def rotation_scores(self, embedding: np.ndarray) -> np.ndarray:
         return self.centroids @ l2_normalize(embedding)
 
+    def best_rotation_match(self, embedding: np.ndarray) -> tuple[float, int, int]:
+        scores = self.rotation_scores(embedding)
+        centroid_index = int(np.argmax(scores))
+        return (
+            float(scores[centroid_index]),
+            centroid_index,
+            self.rotation_angles[centroid_index],
+        )
+
     def score(self, embedding: np.ndarray) -> float:
-        return float(self.rotation_scores(embedding).max())
+        return self.best_rotation_match(embedding)[0]
 
     @property
     def genuine_scores(self) -> np.ndarray:

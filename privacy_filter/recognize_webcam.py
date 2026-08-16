@@ -43,6 +43,20 @@ class ProcessedFrame:
     processing_ms: float
 
 
+def _parse_video_output_size(value: str) -> tuple[int, int]:
+    try:
+        width_text, height_text = value.lower().split("x", maxsplit=1)
+        width = int(width_text)
+        height = int(height_text)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "video output size must have the form WIDTHxHEIGHT, for example 1920x1080"
+        ) from error
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("video output width and height must be positive")
+    return width, height
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Real-time personalized face privacy filter."
@@ -56,6 +70,72 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--camera-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--offline-video",
+        action="store_true",
+        help="Process a video file offline instead of using the camera",
+    )
+    parser.add_argument(
+        "--offline-backend",
+        choices=("grounded-sam2", "sam3"),
+        default="grounded-sam2",
+        help="Offline segmentation backend; defaults to Grounding DINO + SAM 2.1",
+    )
+    parser.add_argument(
+        "--offline-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="PyTorch device for offline processing; auto selects CUDA when available",
+    )
+    parser.add_argument("--video-path", type=Path, default=None)
+    parser.add_argument(
+        "--video-prompt",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Open-vocabulary concept prompt; repeat it to redact multiple concepts "
+            "in one invocation"
+        ),
+    )
+    parser.add_argument("--video-output", type=Path, default=None)
+    parser.add_argument(
+        "--video-output-size",
+        type=_parse_video_output_size,
+        default=None,
+        metavar="WIDTHxHEIGHT",
+        help="Resize the redacted output video, for example 1920x1080",
+    )
+    parser.add_argument("--sam3-checkpoint", type=Path, default=None)
+    parser.add_argument("--sam3-score-threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--grounding-model",
+        default="IDEA-Research/grounding-dino-tiny",
+    )
+    parser.add_argument("--grounding-box-threshold", type=float, default=0.20)
+    parser.add_argument("--grounding-text-threshold", type=float, default=0.20)
+    parser.add_argument(
+        "--grounding-redetect-interval",
+        type=int,
+        default=25,
+        help="Run Grounding DINO every N frames; SAM 2.1 tracks between runs",
+    )
+    parser.add_argument(
+        "--video-inference-max-side",
+        type=int,
+        default=1280,
+        help="Resize model input so its longest side is this size; 0 keeps source size",
+    )
+    parser.add_argument(
+        "--sam2-model",
+        default="facebook/sam2.1-hiera-small",
+    )
+    parser.add_argument("--sam2-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--sam2-model-config",
+        default="configs/sam2.1/sam2.1_hiera_s.yaml",
+    )
+    parser.add_argument("--video-pixel-block-size", type=int, default=16)
     parser.add_argument(
         "--mirror",
         action=argparse.BooleanOptionalAction,
@@ -118,10 +198,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="EMA weight for current-frame lighting measurements",
     )
     parser.add_argument(
-        "--low-light-threshold",
+        "--enrollment-has-difficult-lighting",
+        action="store_true",
+        help=(
+            "Enrollment photos include dark or overexposed examples; use the "
+            "normal authorization threshold in degraded lighting"
+        ),
+    )
+    parser.add_argument(
+        "--difficult-lighting-threshold-increase",
         type=float,
-        default=0.30,
-        help="Authorization threshold used in LOW_LIGHT and OVEREXPOSED",
+        default=0.10,
+        help=(
+            "Threshold increase in LOW_LIGHT and OVEREXPOSED when enrollment "
+            "does not contain difficult-lighting photos"
+        ),
     )
     parser.add_argument("--track-iou-threshold", type=float, default=0.25)
     parser.add_argument("--authorization-iou-threshold", type=float, default=0.40)
@@ -245,6 +336,10 @@ def _draw_label(
         label = f"#{track.track_id} UNKNOWN"
     if track.score is not None:
         label += f" {track.score:.3f}"
+    if track.matching_centroid_index is not None:
+        label += f" IDX:{track.matching_centroid_index}"
+        if track.matching_rotation_angle is not None:
+            label += f" R:{track.matching_rotation_angle}"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     text_y = max(22, y1 - 8)
     cv2.putText(frame, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
@@ -260,6 +355,7 @@ def _draw_metrics(
     visible_tracks: int,
     lighting_modes: tuple[str, ...],
     threshold: float,
+    difficult_lighting_threshold: float,
     confirmations: int,
     authorized_interval: int,
     minimum_face_size: float,
@@ -272,7 +368,8 @@ def _draw_metrics(
         f"FPS {fps:5.1f}",
         f"Detector {detector_ms:5.1f} ms  Recognition {recognition_ms:5.1f} ms ({recognition_calls} calls)",
         (
-            f"Tracks {visible_tracks}  threshold {threshold:.3f}  "
+            f"Tracks {visible_tracks}  threshold normal:{threshold:.3f} "
+            f"difficult:{difficult_lighting_threshold:.3f}  "
             f"confirm {confirmations}  min-face {minimum_face_size:.0f}px  "
             f"recheck {authorized_interval}"
         ),
@@ -299,8 +396,15 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
         raise ValueError("--lighting-padding must be positive")
     if not 0.0 < args.lighting_ema_alpha <= 1.0:
         raise ValueError("--lighting-ema-alpha must be in (0, 1]")
-    if not 0.0 < args.low_light_threshold < 1.0:
-        raise ValueError("--low-light-threshold must be between 0 and 1")
+    if args.difficult_lighting_threshold_increase < 0.0:
+        raise ValueError(
+            "--difficult-lighting-threshold-increase cannot be negative"
+        )
+    if (
+        not args.enrollment_has_difficult_lighting
+        and threshold + args.difficult_lighting_threshold_increase >= 1.0
+    ):
+        raise ValueError("Difficult-lighting authorization threshold must be below 1")
     if args.minimum_recognition_face_size <= 0:
         raise ValueError("--minimum-recognition-face-size must be positive")
     if not 0 < args.minimum_authorized_face_size <= args.minimum_recognition_face_size:
@@ -354,6 +458,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
     threshold = template.threshold if args.threshold is None else args.threshold
     _validate_args(args, threshold)
+    difficult_lighting_threshold = (
+        threshold
+        if args.enrollment_has_difficult_lighting
+        else threshold + args.difficult_lighting_threshold_increase
+    )
 
     detector = YOLOFaceDetector(
         models.detector_runtime,
@@ -372,8 +481,22 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_warmup = embedder.warmup(2)
     print(f"Identity: {template.name}")
     print(f"Template samples: {len(template.embeddings)}")
-    print(f"Template rotation centroids: {list(template.rotation_angles)} degrees")
+    print(
+        "Template rotation centroid indices: "
+        + ", ".join(
+            f"{index}={angle}deg"
+            for index, angle in enumerate(template.rotation_angles)
+        )
+    )
     print(f"Authorization threshold: {threshold:.3f}")
+    print(
+        "Difficult-lighting enrollment photos: "
+        f"{'yes' if args.enrollment_has_difficult_lighting else 'no'}"
+    )
+    print(
+        "LOW_LIGHT/OVEREXPOSED threshold: "
+        f"{difficult_lighting_threshold:.3f}"
+    )
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
     for warning in (detector.provider_warning, embedder.provider_warning):
@@ -498,7 +621,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 effective_threshold = threshold
                 if lighting_mode is not LightingMode.NORMAL:
-                    effective_threshold = args.low_light_threshold
+                    effective_threshold = difficult_lighting_threshold
                 track.lighting_effective_threshold = effective_threshold
 
                 if previous_lighting_mode not in ("UNKNOWN", lighting_mode.value):
@@ -566,6 +689,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 frame_recognition_calls += 1
                 score: float | None = None
+                matching_centroid_index: int | None = None
+                matching_rotation_angle: int | None = None
                 try:
                     recognition_detection = (
                         _unmirror_detection(track.detection, frame_width)
@@ -578,7 +703,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     )
                     recognition_ms += result.latency_ms
                     recognition_call_latencies.append(result.latency_ms)
-                    score = template.score(result.embedding)
+                    (
+                        score,
+                        matching_centroid_index,
+                        matching_rotation_angle,
+                    ) = template.best_rotation_match(result.embedding)
                     if score >= effective_threshold:
                         positive_scores.append(score)
                     else:
@@ -595,6 +724,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     effective_threshold,
                     args.confirmations,
                     frame_index,
+                    matching_centroid_index,
+                    matching_rotation_angle,
                 )
                 if previous is not FaceState.AUTHORIZED and current is FaceState.AUTHORIZED:
                     authorization_grants += 1
@@ -688,6 +819,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 processed.visible_tracks,
                 processed.lighting_modes,
                 threshold,
+                difficult_lighting_threshold,
                 args.confirmations,
                 args.authorized_recheck_interval,
                 args.minimum_recognition_face_size,
@@ -719,7 +851,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 7,
+        "pipeline_version": 8,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "settings": {
@@ -736,8 +868,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "detector_threshold": args.detector_threshold,
             "lighting_padding": args.lighting_padding,
             "lighting_ema_alpha": args.lighting_ema_alpha,
-            "low_light_threshold": args.low_light_threshold,
-            "lighting_policy": "padding-ring_face-information_adaptive-threshold",
+            "enrollment_has_difficult_lighting": (
+                args.enrollment_has_difficult_lighting
+            ),
+            "difficult_lighting_threshold_increase": (
+                args.difficult_lighting_threshold_increase
+            ),
+            "difficult_lighting_threshold": difficult_lighting_threshold,
+            "lighting_policy": "enrollment-aware_conservative-threshold",
             "track_iou_threshold": args.track_iou_threshold,
             "authorization_iou_threshold": args.authorization_iou_threshold,
             "track_max_missed": args.track_max_missed,
@@ -812,8 +950,58 @@ def main() -> None:
     if args.max_frames < 0:
         raise SystemExit("--max-frames cannot be negative")
     try:
+        if args.offline_video:
+            if args.video_path is None:
+                raise ValueError("--video-path is required with --offline-video")
+            if not args.video_prompt:
+                raise ValueError("--video-prompt is required with --offline-video")
+            if args.offline_backend == "sam3":
+                from .sam3_video import process_video_with_sam3
+
+                process_video_with_sam3(
+                    video_path=args.video_path,
+                    prompt=args.video_prompt,
+                    output_path=args.video_output,
+                    checkpoint_path=args.sam3_checkpoint,
+                    score_threshold=args.sam3_score_threshold,
+                    pixel_block_size=args.video_pixel_block_size,
+                    max_frames=args.max_frames,
+                    output_size=args.video_output_size,
+                )
+            else:
+                from .grounded_sam2_video import process_video_with_grounded_sam2
+
+                process_video_with_grounded_sam2(
+                    video_path=args.video_path,
+                    prompt=args.video_prompt,
+                    output_path=args.video_output,
+                    grounding_model_id=args.grounding_model,
+                    sam2_model_id=args.sam2_model,
+                    sam2_checkpoint_path=args.sam2_checkpoint,
+                    sam2_model_config=args.sam2_model_config,
+                    box_threshold=args.grounding_box_threshold,
+                    text_threshold=args.grounding_text_threshold,
+                    redetect_interval=args.grounding_redetect_interval,
+                    inference_max_side=args.video_inference_max_side,
+                    max_frames=args.max_frames,
+                    device=args.offline_device,
+                    pixel_block_size=args.video_pixel_block_size,
+                    output_size=args.video_output_size,
+                )
+            return
+        if any(
+            value is not None
+            for value in (
+                args.video_path,
+                args.video_prompt,
+                args.video_output,
+                args.sam3_checkpoint,
+                args.sam2_checkpoint,
+            )
+        ):
+            raise ValueError("Offline-video model/path options require --offline-video")
         run(args)
-    except (FileNotFoundError, ValueError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         raise SystemExit(f"Error: {error}") from error
 
 

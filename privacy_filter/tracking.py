@@ -35,6 +35,8 @@ class FaceTrack:
     created_frame: int
     state: FaceState = FaceState.PENDING
     score: float | None = None
+    matching_centroid_index: int | None = None
+    matching_rotation_angle: int | None = None
     positive_streak: int = 0
     last_recognition_frame: int | None = None
     last_positive_frame: int | None = None
@@ -72,6 +74,8 @@ class FaceTrack:
     def revoke(self, state: FaceState = FaceState.PENDING) -> None:
         self.state = state
         self.score = None
+        self.matching_centroid_index = None
+        self.matching_rotation_angle = None
         self.positive_streak = 0
         self.last_positive_frame = None
 
@@ -238,6 +242,8 @@ class FaceTrack:
         threshold: float,
         confirmations: int,
         frame_index: int,
+        matching_centroid_index: int | None = None,
+        matching_rotation_angle: int | None = None,
     ) -> tuple[FaceState, FaceState]:
         previous = self.state
         self.last_recognition_frame = frame_index
@@ -245,6 +251,12 @@ class FaceTrack:
         self.last_recognition_detection = self.detection.copy()
         self.verification_required = False
         self.score = None if score is None else float(score)
+        self.matching_centroid_index = (
+            None if score is None else matching_centroid_index
+        )
+        self.matching_rotation_angle = (
+            None if score is None else matching_rotation_angle
+        )
         if score is None or score < threshold:
             self.state = FaceState.UNKNOWN
             self.positive_streak = 0

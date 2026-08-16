@@ -16,6 +16,14 @@ dependencies = [
   "opencv-python>=4.10,<5",
 ]
 
+[project.optional-dependencies]
+grounded-video = [
+  "torch>=2.5.1",
+  "torchvision>=0.20.1",
+  "transformers>=4.50,<6",
+  "pillow>=10,<13",
+]
+
 [project.scripts]
 privacy-enroll = "privacy_filter.enroll_cli:main"
 privacy-recognize = "privacy_filter.recognize_webcam:main"
