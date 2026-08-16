@@ -20,7 +20,11 @@ class DetectionResult:
 def non_maximum_suppression(detections: np.ndarray, threshold: float) -> list[int]:
     if detections.size == 0:
         return []
-    x1, y1, x2, y2, scores = detections.T
+    x1 = detections[:, 0]
+    y1 = detections[:, 1]
+    x2 = detections[:, 2]
+    y2 = detections[:, 3]
+    scores = detections[:, 4]
     areas = np.maximum(0.0, x2 - x1 + 1.0) * np.maximum(0.0, y2 - y1 + 1.0)
     order = scores.argsort()[::-1]
     keep: list[int] = []
@@ -72,6 +76,13 @@ class YOLOFaceDetector:
             raise ValueError(f"Expected a static YOLO input [1,3,H,W], got {shape}")
 
         self.input_size = (shape[3], shape[2])
+        output_dimensions = model.graph.output[0].type.tensor_type.shape.dim
+        output_shape = [
+            value.dim_value if value.HasField("dim_value") else 0
+            for value in output_dimensions
+        ]
+        self.has_landmarks = 20 in output_shape
+        self.detection_width = 20 if self.has_landmarks else 5
         self.threshold = float(threshold)
         self.nms_threshold = float(nms_threshold)
         self._provider_policy = provider.lower()
@@ -164,16 +175,26 @@ class YOLOFaceDetector:
         frame_height: int,
     ) -> np.ndarray:
         rows = self._prediction_rows(output)
+        landmarks: np.ndarray | None = None
         if rows.shape[1] == 6 and np.all(rows[:, 2] >= rows[:, 0]) and np.all(rows[:, 3] >= rows[:, 1]):
             detections = rows[:, :5].copy()
             detections = detections[detections[:, 4] >= self.threshold]
         else:
-            scores = rows[:, 4:].max(axis=1)
+            if self.has_landmarks:
+                if rows.shape[1] != 20:
+                    raise ValueError(
+                        f"Expected YOLO Pose predictions with 20 values, got {rows.shape}"
+                    )
+                scores = rows[:, 4]
+            else:
+                scores = rows[:, 4:].max(axis=1)
             positive = scores >= self.threshold
             boxes = rows[positive, :4]
             scores = scores[positive]
+            if self.has_landmarks:
+                landmarks = rows[positive, 5:20].reshape(-1, 5, 3).copy()
             if not len(boxes):
-                return np.empty((0, 5), dtype=np.float32)
+                return np.empty((0, self.detection_width), dtype=np.float32)
             centers_x, centers_y, widths, heights = boxes.T
             detections = np.column_stack(
                 (
@@ -186,17 +207,29 @@ class YOLOFaceDetector:
             ).astype(np.float32, copy=False)
 
         if not len(detections):
-            return np.empty((0, 5), dtype=np.float32)
+            return np.empty((0, self.detection_width), dtype=np.float32)
         detections[:, [0, 2]] = (detections[:, [0, 2]] - pad_x) / scale
         detections[:, [1, 3]] = (detections[:, [1, 3]] - pad_y) / scale
         detections[:, [0, 2]] = np.clip(detections[:, [0, 2]], 0, frame_width - 1)
         detections[:, [1, 3]] = np.clip(detections[:, [1, 3]], 0, frame_height - 1)
         valid = (detections[:, 2] > detections[:, 0]) & (detections[:, 3] > detections[:, 1])
         detections = detections[valid]
+        if landmarks is not None:
+            landmarks = landmarks[valid]
+            landmarks[:, :, 0] = (landmarks[:, :, 0] - pad_x) / scale
+            landmarks[:, :, 1] = (landmarks[:, :, 1] - pad_y) / scale
+            landmarks[:, :, 0] = np.clip(landmarks[:, :, 0], 0, frame_width - 1)
+            landmarks[:, :, 1] = np.clip(landmarks[:, :, 1], 0, frame_height - 1)
+            landmarks[:, :, 2] = np.clip(landmarks[:, :, 2], 0.0, 1.0)
         order = detections[:, 4].argsort()[::-1]
         detections = detections[order]
+        if landmarks is not None:
+            landmarks = landmarks[order]
         keep = non_maximum_suppression(detections, self.nms_threshold)
-        return detections[keep].astype(np.float32, copy=False)
+        detections = detections[keep]
+        if landmarks is not None:
+            detections = np.column_stack((detections, landmarks[keep].reshape(-1, 15)))
+        return detections.astype(np.float32, copy=False)
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
         if frame.ndim != 3 or frame.shape[2] != 3:

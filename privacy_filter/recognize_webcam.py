@@ -16,11 +16,20 @@ import numpy as np
 from .camera import Camera
 from .enrollment import load_template, sha256_file
 from .lighting import LightingMode, classify_lighting, measure_lighting
-from .model_setup import prepare_runtime_models
+from .model_setup import (
+    detector_model_help,
+    prepare_runtime_models,
+    recognition_model_help,
+)
 from .ort_session import PROVIDER_CHOICES
-from .recognition import FACE_PREPROCESSING, FaceEmbedder
+from .recognition import (
+    FACE_PREPROCESSING,
+    FACE_ROTATION_ANGLES,
+    LANDMARK_FACE_PREPROCESSING,
+    FaceEmbedder,
+)
 from .redaction import pixelate_faces, redact_entire_frame
-from .tracking import FaceState, FaceTrack, FaceTracker
+from .tracking import FaceState, FaceTrack, create_face_tracker
 from .yolo import YOLOFaceDetector
 
 
@@ -62,8 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="Real-time personalized face privacy filter."
     )
     parser.add_argument("--template", default="data/enrollments/owner.npz")
-    parser.add_argument("--detector-model", type=Path, default=None)
-    parser.add_argument("--recognition-model", type=Path, default=None)
+    parser.add_argument(
+        "--detector-model",
+        "--detector",
+        default="yolo11",
+        help=detector_model_help(),
+    )
+    parser.add_argument(
+        "--recognition-model",
+        "--model",
+        default="r34-glint360k",
+        help=recognition_model_help(),
+    )
     parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
     parser.add_argument("--threshold", type=float, default=None, help="Override template threshold")
     parser.add_argument("--camera", type=int, default=0)
@@ -143,12 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mirror the camera preview; enabled by default",
     )
     parser.add_argument(
+        "--rotations",
+        action="store_true",
+        help="Use a template enrolled with 30/90/180/270/330-degree rotations",
+    )
+    parser.add_argument(
         "--authorized-recheck-interval",
         type=int,
-        default=125,
+        default=0,
         help=(
-            "Safety recheck for a stable authorized track in frames; "
-            "default 125 is 5 seconds at 25 FPS; 0 disables it"
+            "Optional safety recheck for a stable authorized track in frames; "
+            "disabled by default"
         ),
     )
     parser.add_argument(
@@ -164,18 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum bbox side in pixels for keeping an authorized track visible",
     )
     parser.add_argument(
-        "--unknown-retry-growth",
-        type=float,
-        default=1.15,
-        help="Retry UNKNOWN only after its face bbox grows by this factor",
+        "--unknown-retry-interval",
+        type=int,
+        default=30,
+        help="Initial UNKNOWN retry delay in frames before exponential backoff",
     )
-    parser.add_argument(
-        "--unknown-retry-movement",
-        type=float,
-        default=0.35,
-        help="Retry UNKNOWN after center movement relative to the previous face size",
-    )
-    parser.add_argument("--unknown-retry-cooldown", type=int, default=5)
     parser.add_argument("--recognition-stable-frames", type=int, default=3)
     parser.add_argument("--recognition-edge-margin", type=float, default=0.05)
     parser.add_argument(
@@ -184,7 +201,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Consecutive positive recognition checks required before reveal",
     )
-    parser.add_argument("--detector-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--detector-threshold",
+        type=float,
+        default=None,
+        help="Detector threshold; defaults to 0.10 for Ultralytics trackers and 0.25 for IoU",
+    )
+    parser.add_argument(
+        "--tracker",
+        choices=("bytetrack", "botsort", "iou"),
+        default="bytetrack",
+        help="Tracking backend; ByteTrack and BoT-SORT are provided by Ultralytics",
+    )
+    parser.add_argument("--tracker-buffer", type=int, default=30)
     parser.add_argument(
         "--lighting-padding",
         type=float,
@@ -260,6 +289,11 @@ def _unmirror_detection(detection: np.ndarray, frame_width: int) -> np.ndarray:
     restored = np.asarray(detection, dtype=np.float32).copy()
     restored[0] = frame_width - detection[2]
     restored[2] = frame_width - detection[0]
+    if restored.size >= 20:
+        landmarks = restored[5:20].reshape(5, 3).copy()
+        landmarks[:, 0] = frame_width - 1 - landmarks[:, 0]
+        landmarks = landmarks[[1, 0, 2, 4, 3]]
+        restored[5:20] = landmarks.reshape(-1)
     return restored
 
 
@@ -412,12 +446,8 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
             "--minimum-authorized-face-size must be positive and no greater than "
             "--minimum-recognition-face-size"
         )
-    if args.unknown_retry_growth <= 1.0:
-        raise ValueError("--unknown-retry-growth must be greater than 1")
-    if args.unknown_retry_movement <= 0:
-        raise ValueError("--unknown-retry-movement must be positive")
-    if args.unknown_retry_cooldown < 1:
-        raise ValueError("--unknown-retry-cooldown must be at least 1")
+    if args.unknown_retry_interval < 1:
+        raise ValueError("--unknown-retry-interval must be at least 1")
     if args.recognition_stable_frames < 1:
         raise ValueError("--recognition-stable-frames must be at least 1")
     if not 0.0 <= args.recognition_edge_margin < 0.5:
@@ -428,6 +458,8 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
         raise ValueError("--confirmations must be at least 1")
     if args.track_max_missed < 0:
         raise ValueError("--track-max-missed cannot be negative")
+    if args.tracker_buffer < 1:
+        raise ValueError("--tracker-buffer must be at least 1")
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -451,12 +483,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "Enrollment was created with a different recognition model. "
             "Re-run privacy-enroll with the current model."
         )
-    if template.metadata.get("face_preprocessing") != FACE_PREPROCESSING:
+    template_angles = tuple(
+        int(value) for value in template.metadata.get("rotation_angles", [0])
+    )
+    expected_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
+    if template_angles != expected_angles:
+        mode = "with --rotations" if args.rotations else "without --rotations"
         raise ValueError(
-            "Enrollment was created with another face crop policy. "
-            "Re-run privacy-enroll for bbox-only recognition."
+            f"Enrollment rotation mode does not match this launch. "
+            f"Create and select a template enrolled {mode}."
         )
     threshold = template.threshold if args.threshold is None else args.threshold
+    if args.detector_threshold is None:
+        args.detector_threshold = 0.25 if args.tracker == "iou" else 0.10
     _validate_args(args, threshold)
     difficult_lighting_threshold = (
         threshold
@@ -469,25 +508,41 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         threshold=args.detector_threshold,
         provider=args.provider,
     )
+    face_preprocessing = (
+        LANDMARK_FACE_PREPROCESSING
+        if detector.has_landmarks
+        else FACE_PREPROCESSING
+    )
+    if template.metadata.get("face_preprocessing") != face_preprocessing:
+        mode = "yolo11-pose" if detector.has_landmarks else "yolo11"
+        raise ValueError(
+            "Enrollment preprocessing does not match the selected detector. "
+            f"Re-run privacy-enroll with --detector {mode}."
+        )
     embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
-    tracker = FaceTracker(
+    tracker = create_face_tracker(
+        backend_name=args.tracker,
         iou_threshold=args.track_iou_threshold,
         max_missed_frames=args.track_max_missed,
         authorization_iou_threshold=args.authorization_iou_threshold,
+        track_buffer=args.tracker_buffer,
     )
     blank = np.zeros((detector.input_size[1], detector.input_size[0], 3), dtype=np.uint8)
     detector.detect(blank)
     detector.detect(blank)
     recognition_warmup = embedder.warmup(2)
     print(f"Identity: {template.name}")
-    print(f"Template samples: {len(template.embeddings)}")
+    print(f"Recognition model: {models.recognition_name}")
+    print(f"Detector model: {models.detector_name}")
     print(
-        "Template rotation centroid indices: "
-        + ", ".join(
-            f"{index}={angle}deg"
-            for index, angle in enumerate(template.rotation_angles)
-        )
+        "Face preprocessing: "
+        f"{'5-point alignment' if detector.has_landmarks else 'bbox crop'}"
     )
+    print(f"Template source photos: {template.metadata.get('source_photos', 'unknown')}")
+    print(f"Template embeddings: {len(template.embeddings)}")
+    print(f"Rotation centroids: {len(template.rotation_centroids)}")
+    print(f"Rotation mode: {'enabled' if args.rotations else 'disabled'}")
+    print("Template matching: maximum similarity across per-rotation centroids.")
     print(f"Authorization threshold: {threshold:.3f}")
     print(
         "Difficult-lighting enrollment photos: "
@@ -499,6 +554,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     )
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
+    print(
+        f"Tracker: {tracker.backend_name} "
+        f"({tracker.backend_version})"
+    )
     for warning in (detector.provider_warning, embedder.provider_warning):
         if warning:
             print(f"Provider warning: {warning}", file=sys.stderr)
@@ -508,15 +567,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         f"{args.recognition_stable_frames} stable frames, {args.confirmations} "
         "confirmations."
     )
-    print(
-        f"UNKNOWN retry: {args.unknown_retry_growth:.2f}x growth or "
-        f"{args.unknown_retry_movement:.2f}x movement after "
-        f"{args.unknown_retry_cooldown} frames."
-    )
-    print(
-        f"Stable AUTHORIZED tracks are rechecked every {args.authorized_recheck_interval} "
-        "frames and immediately hidden when tracking becomes uncertain."
-    )
+    retry_schedule = [
+        min(300, args.unknown_retry_interval * (2 ** exponent))
+        for exponent in range(5)
+    ]
+    print(f"UNKNOWN retry backoff: {retry_schedule} frames, then every 300 frames.")
+    if args.authorized_recheck_interval:
+        print(
+            "Stable AUTHORIZED tracks are rechecked every "
+            f"{args.authorized_recheck_interval} frames."
+        )
+    else:
+        print("Stable AUTHORIZED tracks are not rechecked while tracking is confident.")
+    print("AUTHORIZED tracks are immediately hidden when tracking becomes uncertain.")
     print("Pipeline: camera/UI on main thread, inference on one worker, queue depth 1.")
     print("Privacy rule: PENDING, UNKNOWN, stale, lost, or failed recognition => pixelated.")
 
@@ -571,7 +634,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         try:
             detected = detector.detect(frame)
             detector_ms = detected.latency_ms
-            visible_tracks = tracker.update(detected.detections, frame_index)
+            visible_tracks = tracker.update(detected.detections, frame_index, frame)
             if len(visible_tracks) > 1:
                 crowded_frames += 1
 
@@ -667,9 +730,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 recognition_reason = track.recognition_reason(
                     frame_index,
                     args.minimum_recognition_face_size,
-                    args.unknown_retry_growth,
-                    args.unknown_retry_movement,
-                    args.unknown_retry_cooldown,
+                    args.unknown_retry_interval,
                     args.authorized_recheck_interval,
                 )
                 if recognition_reason is None:
@@ -732,8 +793,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 elif previous is FaceState.AUTHORIZED and current is not FaceState.AUTHORIZED:
                     state_revocations += 1
 
+            authorized_detection_indexes = {
+                track.detection_index
+                for track in visible_tracks
+                if track.authorized and track.detection_index is not None
+            }
             unauthorized = [
-                track.detection for track in visible_tracks if not track.authorized
+                detection
+                for detection_index, detection in enumerate(detected.detections)
+                if detection_index not in authorized_detection_indexes
             ]
             output = (
                 pixelate_faces(frame, np.asarray(unauthorized))
@@ -851,18 +919,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 8,
+        "pipeline_version": 18,
         "identity": template.name,
         "template_samples": len(template.embeddings),
+        "template_source_photos": template.metadata.get("source_photos"),
+        "template_rotation_centroids": len(template.rotation_centroids),
         "settings": {
             "threshold": threshold,
             "confirmations": args.confirmations,
             "authorized_recheck_interval": args.authorized_recheck_interval,
             "minimum_recognition_face_size": args.minimum_recognition_face_size,
             "minimum_authorized_face_size": args.minimum_authorized_face_size,
-            "unknown_retry_growth": args.unknown_retry_growth,
-            "unknown_retry_movement": args.unknown_retry_movement,
-            "unknown_retry_cooldown": args.unknown_retry_cooldown,
+            "unknown_retry_interval": args.unknown_retry_interval,
+            "unknown_retry_policy": "exponential_backoff_x2_cap_300",
             "recognition_stable_frames": args.recognition_stable_frames,
             "recognition_edge_margin": args.recognition_edge_margin,
             "detector_threshold": args.detector_threshold,
@@ -879,9 +948,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "track_iou_threshold": args.track_iou_threshold,
             "authorization_iou_threshold": args.authorization_iou_threshold,
             "track_max_missed": args.track_max_missed,
+            "tracker_backend": tracker.backend_name,
+            "tracker_version": tracker.backend_version,
+            "tracker_buffer": args.tracker_buffer,
+            "tracker_settings": tracker.backend_settings,
             "mirror": args.mirror,
+            "rotations": args.rotations,
+            "rotation_angles": list(template_angles),
+            "template_matching_policy": "per_rotation_centroid_max",
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
-            "face_preprocessing": FACE_PREPROCESSING,
+            "face_preprocessing": face_preprocessing,
             "pipeline": "main-thread-camera_single-worker-inference",
             "pipeline_queue_depth": 1,
         },
@@ -895,6 +971,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "models": {
             "detector_source": str(models.detector_source),
             "detector_runtime": str(models.detector_runtime),
+            "detector_name": models.detector_name,
+            "detector_landmarks": detector.has_landmarks,
+            "recognition_name": models.recognition_name,
             "recognition_source": str(models.recognition_source),
             "recognition_runtime": str(models.recognition_runtime),
             "preferred_execution_provider": models.preferred_execution_provider,
@@ -928,6 +1007,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "authorization_revocations": tracker.revocations + state_revocations,
         },
         "tracker": {
+            "backend": tracker.backend_name,
+            "version": tracker.backend_version,
             "created_tracks": tracker.created_tracks,
             "expired_tracks": tracker.expired_tracks,
             "active_tracks_at_exit": len(tracker.tracks),

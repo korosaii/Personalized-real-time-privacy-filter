@@ -12,7 +12,19 @@ from .ort_session import create_inference_session
 
 
 FACE_PREPROCESSING = "bbox_square_1.20_v1"
-FACE_ROTATION_ANGLES = (0, 90, 180, 270)
+LANDMARK_FACE_PREPROCESSING = "arcface_5pt_similarity_112_v1"
+LANDMARK_CONFIDENCE_THRESHOLD = 0.25
+ARCFACE_DESTINATION = np.asarray(
+    [
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041],
+    ],
+    dtype=np.float32,
+)
+FACE_ROTATION_ANGLES = (0, 30, 90, 180, 270, 330)
 
 
 def rotate_face(face_image: np.ndarray, angle: int) -> np.ndarray:
@@ -26,6 +38,15 @@ def rotate_face(face_image: np.ndarray, angle: int) -> np.ndarray:
         return cv2.rotate(face_image, cv2.ROTATE_180)
     if angle == 270:
         return cv2.rotate(face_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if angle in (30, 330):
+        transform = cv2.getRotationMatrix2D((55.5, 55.5), angle, 1.0)
+        return cv2.warpAffine(
+            face_image,
+            transform,
+            (112, 112),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
     raise ValueError(f"Unsupported face rotation: {angle}")
 
 
@@ -132,7 +153,7 @@ class FaceEmbedder:
         return embedding, (perf_counter() - started) * 1000.0
 
     @staticmethod
-    def extract_face(
+    def extract_bbox_face(
         frame: np.ndarray,
         detection: np.ndarray,
         scale: float = 1.20,
@@ -167,9 +188,56 @@ class FaceEmbedder:
             borderMode=cv2.BORDER_REPLICATE,
         )
 
+    @staticmethod
+    def extract_aligned_face(
+        frame: np.ndarray,
+        detection: np.ndarray,
+        confidence_threshold: float = LANDMARK_CONFIDENCE_THRESHOLD,
+    ) -> np.ndarray:
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("frame must be a BGR image with shape HxWx3")
+        values = np.asarray(detection, dtype=np.float32).reshape(-1)
+        if values.size < 20 or not np.isfinite(values[:20]).all():
+            raise ValueError("detection does not contain five finite landmarks")
+        landmarks = values[5:20].reshape(5, 3)
+        valid = landmarks[:, 2] >= confidence_threshold
+        if not valid[0] or not valid[1] or not valid[2] or int(valid.sum()) < 4:
+            raise ValueError("landmark confidence is too low for safe face alignment")
+        eye_distance = float(np.linalg.norm(landmarks[0, :2] - landmarks[1, :2]))
+        if eye_distance < 4.0:
+            raise ValueError("eye landmarks are too close for face alignment")
+        transform, _ = cv2.estimateAffinePartial2D(
+            landmarks[valid, :2],
+            ARCFACE_DESTINATION[valid],
+            method=cv2.LMEDS,
+        )
+        if transform is None or transform.shape != (2, 3) or not np.isfinite(transform).all():
+            raise ValueError("could not estimate a stable face alignment transform")
+        return cv2.warpAffine(
+            frame,
+            transform,
+            (112, 112),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    @classmethod
+    def extract_face(
+        cls,
+        frame: np.ndarray,
+        detection: np.ndarray,
+        scale: float = 1.20,
+    ) -> np.ndarray:
+        values = np.asarray(detection, dtype=np.float32).reshape(-1)
+        if values.size >= 20:
+            return cls.extract_aligned_face(frame, values)
+        return cls.extract_bbox_face(frame, values, scale)
+
     def embed_bbox(self, frame: np.ndarray, detection: np.ndarray) -> EmbeddingResult:
+        started = perf_counter()
         face_image = self.extract_face(frame, detection)
-        embedding, latency_ms = self.embed_face(face_image)
+        embedding, _ = self.embed_face(face_image)
+        latency_ms = (perf_counter() - started) * 1000.0
         return EmbeddingResult(embedding, face_image, latency_ms)
 
     def warmup(self, runs: int = 2) -> list[float]:

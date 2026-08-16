@@ -11,7 +11,7 @@ import re
 import cv2
 import numpy as np
 
-from .recognition import FACE_ROTATION_ANGLES, l2_normalize
+from .recognition import l2_normalize
 
 
 @dataclass(frozen=True)
@@ -76,8 +76,7 @@ def safe_identity_name(name: str) -> str:
 class EnrollmentTemplate:
     name: str
     embeddings: np.ndarray
-    centroids: np.ndarray
-    rotation_angles: tuple[int, ...]
+    rotation_centroids: np.ndarray
     model_sha256: str
     threshold: float
     metadata: dict[str, object]
@@ -85,10 +84,15 @@ class EnrollmentTemplate:
     @property
     def centroid(self) -> np.ndarray:
         """The upright centroid retained for callers using the legacy API."""
-        return self.centroids[0]
+        return self.rotation_centroids[0]
+
+    @property
+    def rotation_angles(self) -> tuple[int, ...]:
+        stored = self.metadata.get("rotation_angles", [0])
+        return tuple(int(value) for value in stored)
 
     def rotation_scores(self, embedding: np.ndarray) -> np.ndarray:
-        return self.centroids @ l2_normalize(embedding)
+        return self.rotation_centroids @ l2_normalize(embedding)
 
     def best_rotation_match(self, embedding: np.ndarray) -> tuple[float, int, int]:
         scores = self.rotation_scores(embedding)
@@ -102,10 +106,6 @@ class EnrollmentTemplate:
     def score(self, embedding: np.ndarray) -> float:
         return self.best_rotation_match(embedding)[0]
 
-    @property
-    def genuine_scores(self) -> np.ndarray:
-        return np.einsum("nad,ad->na", self.embeddings, self.centroids)
-
 
 def build_template(
     name: str,
@@ -115,49 +115,58 @@ def build_template(
     minimum_samples: int = 1,
     source: str = "unknown",
     face_preprocessing: str = "unknown",
+    rotation_angles: tuple[int, ...] | None = None,
 ) -> EnrollmentTemplate:
     matrix = np.asarray(embeddings, dtype=np.float32)
-    if matrix.ndim == 2 and matrix.shape[1] == 512:
-        matrix = matrix[:, None, :]
-        rotation_angles = (0,)
-    elif matrix.ndim == 3 and matrix.shape[2] == 512:
-        if matrix.shape[1] != len(FACE_ROTATION_ANGLES):
-            raise ValueError(
-                f"Expected Nx{len(FACE_ROTATION_ANGLES)}x512 embeddings, got {matrix.shape}"
-            )
-        rotation_angles = FACE_ROTATION_ANGLES
+    if matrix.ndim == 3 and matrix.shape[2] == 512:
+        source_photos = int(matrix.shape[0])
+        rotations_per_photo = int(matrix.shape[1])
+        cube = np.asarray(
+            [[l2_normalize(embedding) for embedding in sample] for sample in matrix],
+            dtype=np.float32,
+        )
+    elif matrix.ndim == 2 and matrix.shape[1] == 512:
+        source_photos = int(matrix.shape[0])
+        rotations_per_photo = 1
+        cube = np.vstack([l2_normalize(row) for row in matrix]).astype(np.float32)
+        cube = cube[:, None, :]
     else:
-        raise ValueError(f"Expected Nx512 or Nx4x512 embeddings, got {matrix.shape}")
-    if matrix.shape[0] < minimum_samples:
-        raise ValueError(f"Need at least {minimum_samples} accepted samples, got {matrix.shape[0]}")
-    matrix = np.asarray(
+        raise ValueError(f"Expected Nx512 or NxRx512 embeddings, got {matrix.shape}")
+    if source_photos < minimum_samples:
+        raise ValueError(
+            f"Need at least {minimum_samples} accepted samples, got {source_photos}"
+        )
+    matrix = cube.reshape(-1, 512)
+    rotation_centroids = np.vstack(
         [
-            [l2_normalize(embedding) for embedding in sample]
-            for sample in matrix
-        ],
-        dtype=np.float32,
+            l2_normalize(cube[:, rotation_index, :].mean(axis=0))
+            for rotation_index in range(rotations_per_photo)
+        ]
+    ).astype(np.float32)
+    resolved_rotation_angles = (
+        tuple(rotation_angles)
+        if rotation_angles is not None
+        else ((0,) if rotations_per_photo == 1 else tuple(range(rotations_per_photo)))
     )
-    centroids = np.asarray(
-        [l2_normalize(matrix[:, index, :].mean(axis=0)) for index in range(matrix.shape[1])],
-        dtype=np.float32,
-    )
-    scores = np.einsum("nad,ad->na", matrix, centroids)
+    if len(resolved_rotation_angles) != rotations_per_photo:
+        raise ValueError(
+            "The number of rotation angles must match embeddings per photo"
+        )
     metadata: dict[str, object] = {
-        "version": 2,
+        "version": 9,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
         "face_preprocessing": face_preprocessing,
-        "samples": int(matrix.shape[0]),
-        "rotation_angles": list(rotation_angles),
-        "genuine_score_min": round(float(scores.min()), 6),
-        "genuine_score_mean": round(float(scores.mean()), 6),
-        "genuine_score_max": round(float(scores.max()), 6),
+        "source_photos": source_photos,
+        "embeddings": int(matrix.shape[0]),
+        "rotations_per_photo": rotations_per_photo,
+        "rotation_angles": list(resolved_rotation_angles),
+        "matching_policy": "per_rotation_centroid_max",
     }
     return EnrollmentTemplate(
         name=safe_identity_name(name),
         embeddings=matrix,
-        centroids=centroids,
-        rotation_angles=rotation_angles,
+        rotation_centroids=rotation_centroids,
         model_sha256=model_sha256,
         threshold=float(threshold),
         metadata=metadata,
@@ -173,9 +182,7 @@ def save_template(template: EnrollmentTemplate, path: str | Path) -> Path:
             destination,
             name=np.asarray(template.name),
             embeddings=template.embeddings.astype(np.float32),
-            centroid=template.centroid.astype(np.float32),
-            centroids=template.centroids.astype(np.float32),
-            rotation_angles=np.asarray(template.rotation_angles, dtype=np.int16),
+            rotation_centroids=template.rotation_centroids.astype(np.float32),
             model_sha256=np.asarray(template.model_sha256),
             threshold=np.asarray(template.threshold, dtype=np.float32),
             metadata_json=np.asarray(json.dumps(template.metadata, ensure_ascii=False)),
@@ -190,42 +197,52 @@ def load_template(path: str | Path) -> EnrollmentTemplate:
     if not source.is_file():
         raise FileNotFoundError(f"Enrollment template not found: {source}")
     with np.load(source, allow_pickle=False) as archive:
-        required = {"name", "embeddings", "centroid", "model_sha256", "threshold", "metadata_json"}
+        required = {"name", "embeddings", "model_sha256", "threshold", "metadata_json"}
         missing = required.difference(archive.files)
         if missing:
             raise ValueError(f"Enrollment template is missing fields: {sorted(missing)}")
         name = str(archive["name"].item())
         embeddings = np.asarray(archive["embeddings"], dtype=np.float32)
-        if "centroids" in archive.files:
-            centroids = np.asarray(archive["centroids"], dtype=np.float32)
-            rotation_angles = tuple(int(value) for value in archive["rotation_angles"])
-        else:
-            centroids = np.asarray(archive["centroid"], dtype=np.float32).reshape(1, -1)
-            rotation_angles = (0,)
+        stored_centroids = (
+            np.asarray(archive["rotation_centroids"], dtype=np.float32)
+            if "rotation_centroids" in archive.files
+            else None
+        )
         model_hash = str(archive["model_sha256"].item())
         threshold = float(archive["threshold"].item())
         metadata = json.loads(str(archive["metadata_json"].item()))
-    if embeddings.ndim == 2 and embeddings.shape[1] == 512:
-        embeddings = embeddings[:, None, :]
-    if embeddings.ndim != 3 or embeddings.shape[2] != 512:
+    if embeddings.ndim == 3 and embeddings.shape[2] == 512:
+        cube = embeddings
+        embeddings = cube.reshape(-1, 512)
+    else:
+        rotations_per_photo = int(metadata.get("rotations_per_photo", 1))
+        source_photos = int(metadata.get("source_photos", 0))
+        if source_photos * rotations_per_photo == len(embeddings):
+            cube = embeddings.reshape(source_photos, rotations_per_photo, 512)
+        else:
+            cube = embeddings.reshape(len(embeddings), 1, 512)
+    if embeddings.ndim != 2 or embeddings.shape[1] != 512:
         raise ValueError(f"Invalid enrollment embedding shape: {embeddings.shape}")
-    if centroids.ndim != 2 or centroids.shape[1] != 512:
-        raise ValueError(f"Invalid enrollment centroid shape: {centroids.shape}")
-    if embeddings.shape[1] != len(centroids) or len(rotation_angles) != len(centroids):
-        raise ValueError("Enrollment rotations, embeddings, and centroids do not match")
-    embeddings = np.asarray(
-        [
-            [l2_normalize(embedding) for embedding in sample]
-            for sample in embeddings
-        ],
-        dtype=np.float32,
-    )
-    centroids = np.vstack([l2_normalize(row) for row in centroids]).astype(np.float32)
+    embeddings = np.vstack([l2_normalize(row) for row in embeddings]).astype(np.float32)
+    if stored_centroids is None:
+        rotation_centroids = np.vstack(
+            [
+                l2_normalize(cube[:, rotation_index, :].mean(axis=0))
+                for rotation_index in range(cube.shape[1])
+            ]
+        ).astype(np.float32)
+    else:
+        if stored_centroids.ndim != 2 or stored_centroids.shape[1] != 512:
+            raise ValueError(
+                f"Invalid rotation centroid shape: {stored_centroids.shape}"
+            )
+        rotation_centroids = np.vstack(
+            [l2_normalize(row) for row in stored_centroids]
+        ).astype(np.float32)
     return EnrollmentTemplate(
         name,
         embeddings,
-        centroids,
-        rotation_angles,
+        rotation_centroids,
         model_hash,
         threshold,
         metadata,
