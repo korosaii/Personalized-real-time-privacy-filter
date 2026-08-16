@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 from time import perf_counter
@@ -13,7 +14,7 @@ from time import perf_counter
 import cv2
 import numpy as np
 
-from .camera import Camera
+from .camera import Camera, VideoFile
 from .enrollment import load_template, sha256_file
 from .lighting import LightingMode, classify_lighting, measure_lighting
 from .model_setup import (
@@ -66,6 +67,28 @@ def _parse_video_output_size(value: str) -> tuple[int, int]:
     return width, height
 
 
+def _create_video_writer(
+    output_path: Path,
+    fps: float,
+    frame_size: tuple[int, int],
+) -> tuple[cv2.VideoWriter, Path]:
+    output_path = output_path.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(
+        f"{output_path.stem}.part{output_path.suffix or '.mp4'}"
+    )
+    writer = cv2.VideoWriter(
+        str(temporary_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        frame_size,
+    )
+    if not writer.isOpened():
+        writer.release()
+        raise RuntimeError(f"Could not create output video: {output_path}")
+    return writer, temporary_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Real-time personalized face privacy filter."
@@ -95,10 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process a video file offline instead of using the camera",
     )
     parser.add_argument(
-        "--offline-backend",
-        choices=("grounded-sam2", "sam3"),
-        default="grounded-sam2",
-        help="Offline segmentation backend; defaults to Grounding DINO + SAM 2.1",
+        "--realtime-video",
+        action="store_true",
+        help="Process a video file with the real-time face-recognition pipeline",
     )
     parser.add_argument(
         "--offline-device",
@@ -125,8 +147,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="WIDTHxHEIGHT",
         help="Resize the redacted output video, for example 1920x1080",
     )
-    parser.add_argument("--sam3-checkpoint", type=Path, default=None)
-    parser.add_argument("--sam3-score-threshold", type=float, default=0.50)
     parser.add_argument(
         "--grounding-model",
         default="IDEA-Research/grounding-dino-tiny",
@@ -158,8 +178,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mirror",
         action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Mirror frames; enabled by default for the webcam and disabled for files",
+    )
+    parser.add_argument(
+        "--preview",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Mirror the camera preview; enabled by default",
+        help="Show the processed stream in a window; enabled by default",
     )
     parser.add_argument(
         "--rotations",
@@ -580,16 +606,35 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     else:
         print("Stable AUTHORIZED tracks are not rechecked while tracking is confident.")
     print("AUTHORIZED tracks are immediately hidden when tracking becomes uncertain.")
-    print("Pipeline: camera/UI on main thread, inference on one worker, queue depth 1.")
+    source_kind = "video file" if args.realtime_video else "camera"
+    print(f"Pipeline: {source_kind}/UI on main thread, inference on one worker, queue depth 1.")
     print("Privacy rule: PENDING, UNKNOWN, stale, lost, or failed recognition => pixelated.")
 
-    camera = Camera(args.camera, args.width, args.height, args.camera_fps)
+    camera = (
+        VideoFile(args.video_path)
+        if args.realtime_video
+        else Camera(args.camera, args.width, args.height, args.camera_fps)
+    )
     print(
-        f"Camera: {camera.info.width}x{camera.info.height} at reported "
+        f"Input: {camera.info.width}x{camera.info.height} at reported "
         f"{camera.info.fps:.1f} FPS ({camera.info.backend})"
     )
-    print(f"Camera mirror: {'enabled' if args.mirror else 'disabled'}")
+    print(f"Mirror: {'enabled' if args.mirror else 'disabled'}")
+    output_path = args.video_output.expanduser().resolve() if args.video_output else None
+    output_size = args.video_output_size or (camera.info.width, camera.info.height)
+    writer: cv2.VideoWriter | None = None
+    temporary_output_path: Path | None = None
+    if output_path is not None:
+        writer, temporary_output_path = _create_video_writer(
+            output_path,
+            camera.info.fps,
+            output_size,
+        )
+        print(f"Recording: {output_path} ({output_size[0]}x{output_size[1]})")
+    else:
+        print("Recording: disabled")
     started = perf_counter()
+    recording_started = started
     rolling_ms: deque[float] = deque(maxlen=120)
     detector_latencies: list[float] = []
     recognition_frame_latencies: list[float] = []
@@ -615,6 +660,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     unknown_observations = 0
     crowded_frames = 0
     interrupted = False
+    recorded_frames = 0
+    recorded_source_frames = 0
 
     def process_frame(frame: np.ndarray, frame_index: int) -> ProcessedFrame:
         nonlocal failures
@@ -862,6 +909,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         camera_started = perf_counter()
         first_frame = camera.read()
         camera_read_latencies.append((perf_counter() - camera_started) * 1000.0)
+        if first_frame is None:
+            raise RuntimeError("Input did not provide any video frames")
         submitted_frames = 1
         pending = executor.submit(process_frame, first_frame, submitted_frames)
 
@@ -892,8 +941,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 args.authorized_recheck_interval,
                 args.minimum_recognition_face_size,
             )
-            cv2.imshow(WINDOW_TITLE, processed.output)
-            key = cv2.waitKey(1) & 0xFF
+            if writer is not None:
+                recorded = processed.output
+                if (recorded.shape[1], recorded.shape[0]) != output_size:
+                    recorded = cv2.resize(recorded, output_size, interpolation=cv2.INTER_AREA)
+                if args.realtime_video:
+                    writer.write(recorded)
+                    recorded_frames += 1
+                else:
+                    target_count = max(
+                        recorded_frames + 1,
+                        int(round((perf_counter() - recording_started) * camera.info.fps)),
+                    )
+                    while recorded_frames < target_count:
+                        writer.write(recorded)
+                        recorded_frames += 1
+                recorded_source_frames += 1
+            key = -1
+            if args.preview:
+                cv2.imshow(WINDOW_TITLE, processed.output)
+                key = cv2.waitKey(1) & 0xFF
             loop_ms = (perf_counter() - loop_started) * 1000.0
             rolling_ms.append(loop_ms)
             loop_latencies.append(loop_ms)
@@ -914,12 +981,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             pending.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
         camera.close()
+        if writer is not None:
+            writer.release()
+            if temporary_output_path is not None and output_path is not None:
+                os.replace(temporary_output_path, output_path)
         cv2.destroyAllWindows()
 
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 18,
+        "pipeline_version": 19,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "template_source_photos": template.metadata.get("source_photos"),
@@ -953,12 +1024,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "tracker_buffer": args.tracker_buffer,
             "tracker_settings": tracker.backend_settings,
             "mirror": args.mirror,
+            "preview": args.preview,
+            "realtime_video": args.realtime_video,
             "rotations": args.rotations,
             "rotation_angles": list(template_angles),
             "template_matching_policy": "per_rotation_centroid_max",
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
             "face_preprocessing": face_preprocessing,
-            "pipeline": "main-thread-camera_single-worker-inference",
+            "pipeline": f"main-thread-{source_kind.replace(' ', '-')}_single-worker-inference",
             "pipeline_queue_depth": 1,
         },
         "detector_providers": detector.providers,
@@ -979,6 +1052,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "preferred_execution_provider": models.preferred_execution_provider,
         },
         "frames": frames,
+        "input": {
+            "kind": source_kind,
+            "path": str(args.video_path.resolve()) if args.video_path else None,
+            "width": camera.info.width,
+            "height": camera.info.height,
+            "fps": camera.info.fps,
+        },
+        "output": {
+            "path": str(output_path) if output_path else None,
+            "width": output_size[0] if output_path else None,
+            "height": output_size[1] if output_path else None,
+            "recorded_frames": recorded_frames,
+            "recorded_source_frames": recorded_source_frames,
+            "recording_timing": (
+                "source_fps_one_output_per_input"
+                if args.realtime_video
+                else "wall_clock_frame_duplication"
+            ) if output_path else None,
+            "audio_preserved": False,
+        },
         "failures": failures,
         "interrupted": interrupted,
         "elapsed_seconds": round(elapsed, 3),
@@ -1031,56 +1124,48 @@ def main() -> None:
     if args.max_frames < 0:
         raise SystemExit("--max-frames cannot be negative")
     try:
+        if args.offline_video and args.realtime_video:
+            raise ValueError("--offline-video and --realtime-video are mutually exclusive")
+        if args.video_output_size is not None and args.video_output is None:
+            raise ValueError("--video-output-size requires --video-output")
         if args.offline_video:
             if args.video_path is None:
                 raise ValueError("--video-path is required with --offline-video")
             if not args.video_prompt:
                 raise ValueError("--video-prompt is required with --offline-video")
-            if args.offline_backend == "sam3":
-                from .sam3_video import process_video_with_sam3
+            from .grounded_sam2_video import process_video_with_grounded_sam2
 
-                process_video_with_sam3(
-                    video_path=args.video_path,
-                    prompt=args.video_prompt,
-                    output_path=args.video_output,
-                    checkpoint_path=args.sam3_checkpoint,
-                    score_threshold=args.sam3_score_threshold,
-                    pixel_block_size=args.video_pixel_block_size,
-                    max_frames=args.max_frames,
-                    output_size=args.video_output_size,
-                )
-            else:
-                from .grounded_sam2_video import process_video_with_grounded_sam2
-
-                process_video_with_grounded_sam2(
-                    video_path=args.video_path,
-                    prompt=args.video_prompt,
-                    output_path=args.video_output,
-                    grounding_model_id=args.grounding_model,
-                    sam2_model_id=args.sam2_model,
-                    sam2_checkpoint_path=args.sam2_checkpoint,
-                    sam2_model_config=args.sam2_model_config,
-                    box_threshold=args.grounding_box_threshold,
-                    text_threshold=args.grounding_text_threshold,
-                    redetect_interval=args.grounding_redetect_interval,
-                    inference_max_side=args.video_inference_max_side,
-                    max_frames=args.max_frames,
-                    device=args.offline_device,
-                    pixel_block_size=args.video_pixel_block_size,
-                    output_size=args.video_output_size,
-                )
-            return
-        if any(
-            value is not None
-            for value in (
-                args.video_path,
-                args.video_prompt,
-                args.video_output,
-                args.sam3_checkpoint,
-                args.sam2_checkpoint,
+            process_video_with_grounded_sam2(
+                video_path=args.video_path,
+                prompt=args.video_prompt,
+                output_path=args.video_output,
+                grounding_model_id=args.grounding_model,
+                sam2_model_id=args.sam2_model,
+                sam2_checkpoint_path=args.sam2_checkpoint,
+                sam2_model_config=args.sam2_model_config,
+                box_threshold=args.grounding_box_threshold,
+                text_threshold=args.grounding_text_threshold,
+                redetect_interval=args.grounding_redetect_interval,
+                inference_max_side=args.video_inference_max_side,
+                max_frames=args.max_frames,
+                device=args.offline_device,
+                pixel_block_size=args.video_pixel_block_size,
+                output_size=args.video_output_size,
             )
-        ):
-            raise ValueError("Offline-video model/path options require --offline-video")
+            return
+        if args.realtime_video:
+            if args.video_path is None:
+                raise ValueError("--video-path is required with --realtime-video")
+            if args.video_output is None:
+                raise ValueError("--video-output is required with --realtime-video")
+            if args.video_prompt:
+                raise ValueError("--video-prompt is only used with --offline-video")
+        elif args.video_path is not None:
+            raise ValueError("--video-path requires --offline-video or --realtime-video")
+        elif args.video_prompt or args.sam2_checkpoint is not None:
+            raise ValueError("Grounded SAM 2 options require --offline-video")
+        if args.mirror is None:
+            args.mirror = not args.realtime_video
         run(args)
     except (OSError, ValueError, RuntimeError) as error:
         raise SystemExit(f"Error: {error}") from error

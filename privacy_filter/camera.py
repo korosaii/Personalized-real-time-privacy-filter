@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import platform
 
 import cv2
@@ -13,6 +14,7 @@ class CameraInfo:
     height: int
     fps: float
     backend: str
+    frames: int | None = None
 
 
 def camera_backends(system: str | None = None) -> tuple[int, ...]:
@@ -75,6 +77,49 @@ class Camera:
         self._capture.release()
 
     def __enter__(self) -> "Camera":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+class VideoFile:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser().resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"Input video not found: {self.path}")
+        self._capture = cv2.VideoCapture(str(self.path))
+        if not self._capture.isOpened():
+            raise RuntimeError(f"Could not open input video: {self.path}")
+        width = int(self._capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = float(self._capture.get(cv2.CAP_PROP_FPS))
+        if width <= 0 or height <= 0:
+            self._capture.release()
+            raise RuntimeError(f"Input video has an invalid frame size: {self.path}")
+        if not np.isfinite(fps) or fps <= 0.0:
+            fps = 25.0
+        frame_count = max(0, int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        try:
+            backend_name = self._capture.getBackendName()
+        except cv2.error:
+            backend_name = "unknown"
+        self.info = CameraInfo(
+            width=width,
+            height=height,
+            fps=fps,
+            backend=f"file/{backend_name}",
+            frames=frame_count or None,
+        )
+
+    def read(self) -> np.ndarray | None:
+        ok, frame = self._capture.read()
+        return frame if ok else None
+
+    def close(self) -> None:
+        self._capture.release()
+
+    def __enter__(self) -> "VideoFile":
         return self
 
     def __exit__(self, *_args: object) -> None:
