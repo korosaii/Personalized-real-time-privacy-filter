@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from importlib.metadata import version
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -38,13 +43,12 @@ class FaceTrack:
     matching_centroid_index: int | None = None
     matching_rotation_angle: int | None = None
     positive_streak: int = 0
+    unknown_attempts: int = 0
     last_recognition_frame: int | None = None
     last_positive_frame: int | None = None
     missed_frames: int = 0
     visible_frames: int = 1
     last_match_iou: float = 1.0
-    last_recognition_size: float | None = None
-    last_recognition_detection: np.ndarray | None = None
     tracking_confident: bool = False
     verification_required: bool = True
     stable_matches: int = 0
@@ -57,6 +61,7 @@ class FaceTrack:
     lighting_face_black_ratio: float | None = None
     lighting_face_white_ratio: float | None = None
     lighting_effective_threshold: float | None = None
+    detection_index: int | None = None
     velocity: np.ndarray = field(
         default_factory=lambda: np.zeros(4, dtype=np.float32)
     )
@@ -77,6 +82,7 @@ class FaceTrack:
         self.matching_centroid_index = None
         self.matching_rotation_angle = None
         self.positive_streak = 0
+        self.unknown_attempts = 0
         self.last_positive_frame = None
 
     def mark_uncertain(self) -> bool:
@@ -161,17 +167,13 @@ class FaceTrack:
         self,
         frame_index: int,
         minimum_face_size: float,
-        unknown_retry_growth: float,
-        unknown_retry_movement: float,
-        unknown_retry_cooldown: int,
+        unknown_retry_interval: int,
         authorized_recheck_interval: int,
     ) -> bool:
         return self.recognition_reason(
             frame_index,
             minimum_face_size,
-            unknown_retry_growth,
-            unknown_retry_movement,
-            unknown_retry_cooldown,
+            unknown_retry_interval,
             authorized_recheck_interval,
         ) is not None
 
@@ -179,9 +181,7 @@ class FaceTrack:
         self,
         frame_index: int,
         minimum_face_size: float,
-        unknown_retry_growth: float,
-        unknown_retry_movement: float,
-        unknown_retry_cooldown: int,
+        unknown_retry_interval: int,
         authorized_recheck_interval: int,
     ) -> str | None:
         if self.overlap_uncertain:
@@ -195,38 +195,10 @@ class FaceTrack:
         if self.state is FaceState.PENDING and self.positive_streak > 0:
             return "confirmation"
         if self.state is FaceState.UNKNOWN:
-            if (
-                self.last_recognition_frame is not None
-                and frame_index - self.last_recognition_frame < unknown_retry_cooldown
-            ):
-                return None
-            if (
-                self.last_recognition_size is None
-                or self.face_size >= self.last_recognition_size * unknown_retry_growth
-            ):
-                return "face_grew"
-            if self.last_recognition_detection is not None:
-                previous = self.last_recognition_detection
-                previous_center = np.asarray(
-                    [
-                        (previous[0] + previous[2]) / 2.0,
-                        (previous[1] + previous[3]) / 2.0,
-                    ],
-                    dtype=np.float32,
-                )
-                current_center = np.asarray(
-                    [
-                        (self.detection[0] + self.detection[2]) / 2.0,
-                        (self.detection[1] + self.detection[3]) / 2.0,
-                    ],
-                    dtype=np.float32,
-                )
-                movement = float(
-                    np.linalg.norm(current_center - previous_center)
-                    / max(self.last_recognition_size or 1.0, 1.0)
-                )
-                if movement >= unknown_retry_movement:
-                    return "face_moved"
+            exponent = min(4, max(0, self.unknown_attempts - 1))
+            retry_interval = min(300, unknown_retry_interval * (2 ** exponent))
+            if frame_index - self.last_recognition_frame >= retry_interval:
+                return "unknown_periodic_retry"
             return None
         if (
             authorized_recheck_interval > 0
@@ -247,8 +219,6 @@ class FaceTrack:
     ) -> tuple[FaceState, FaceState]:
         previous = self.state
         self.last_recognition_frame = frame_index
-        self.last_recognition_size = self.face_size
-        self.last_recognition_detection = self.detection.copy()
         self.verification_required = False
         self.score = None if score is None else float(score)
         self.matching_centroid_index = (
@@ -258,11 +228,15 @@ class FaceTrack:
             None if score is None else matching_rotation_angle
         )
         if score is None or score < threshold:
+            self.unknown_attempts = (
+                self.unknown_attempts + 1 if previous is FaceState.UNKNOWN else 1
+            )
             self.state = FaceState.UNKNOWN
             self.positive_streak = 0
             self.last_positive_frame = None
             return previous, self.state
 
+        self.unknown_attempts = 0
         self.last_positive_frame = frame_index
         self.positive_streak = min(confirmations, self.positive_streak + 1)
         if self.positive_streak >= confirmations:
@@ -299,16 +273,25 @@ class FaceTracker:
         self.created_tracks = 0
         self.expired_tracks = 0
         self.revocations = 0
+        self.backend_name = "iou"
+        self.backend_version = "local"
+        self.backend_settings = {
+            "iou_threshold": self.iou_threshold,
+            "authorization_iou_threshold": self.authorization_iou_threshold,
+            "max_missed_frames": self.max_missed_frames,
+        }
 
     def _new_track(
         self,
         detection: np.ndarray,
         frame_index: int,
+        detection_index: int,
     ) -> FaceTrack:
         track = FaceTrack(
             track_id=self.next_track_id,
             detection=np.asarray(detection, dtype=np.float32).copy(),
             created_frame=frame_index,
+            detection_index=detection_index,
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -319,6 +302,7 @@ class FaceTracker:
         self,
         detections: np.ndarray,
         frame_index: int,
+        frame: np.ndarray | None = None,
     ) -> list[FaceTrack]:
         boxes = np.asarray(detections, dtype=np.float32)
         if boxes.size == 0:
@@ -327,6 +311,8 @@ class FaceTracker:
             raise ValueError(f"Expected Nx4+ detections, got {boxes.shape}")
 
         existing = list(self.tracks.values())
+        for track in existing:
+            track.detection_index = None
         matches: dict[int, tuple[int, float, bool]] = {}
         if existing and len(boxes):
             overlaps = np.asarray(
@@ -372,6 +358,7 @@ class FaceTracker:
                     self.revocations += 1
                 continue
             detection_index, overlap, ambiguous = matches[track_index]
+            track.detection_index = detection_index
             if track.update_geometry(
                 boxes[detection_index],
                 overlap,
@@ -387,6 +374,7 @@ class FaceTracker:
             visible_by_detection[detection_index] = self._new_track(
                 detection,
                 frame_index,
+                detection_index,
             )
 
         visible_tracks = [
@@ -416,3 +404,216 @@ class FaceTracker:
             self.expired_tracks += 1
 
         return visible_tracks
+
+
+class _UltralyticsDetections:
+    def __init__(self, detections: np.ndarray) -> None:
+        values = np.asarray(detections, dtype=np.float32)
+        if values.size == 0:
+            values = np.empty((0, 5), dtype=np.float32)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        self.data = values
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index: Any) -> _UltralyticsDetections:
+        return _UltralyticsDetections(self.data[index])
+
+    @property
+    def xyxy(self) -> np.ndarray:
+        return self.data[:, :4]
+
+    @property
+    def xywh(self) -> np.ndarray:
+        values = self.xyxy.copy()
+        values[:, 2] -= values[:, 0]
+        values[:, 3] -= values[:, 1]
+        values[:, 0] += values[:, 2] / 2.0
+        values[:, 1] += values[:, 3] / 2.0
+        return values
+
+    @property
+    def conf(self) -> np.ndarray:
+        return self.data[:, 4]
+
+    @property
+    def cls(self) -> np.ndarray:
+        return np.zeros(len(self.data), dtype=np.float32)
+
+
+class UltralyticsFaceTracker:
+    def __init__(
+        self,
+        backend_name: str,
+        max_missed_frames: int = 8,
+        authorization_iou_threshold: float = 0.40,
+        overlap_uncertainty_threshold: float = 0.05,
+        track_buffer: int = 30,
+    ) -> None:
+        if backend_name not in {"bytetrack", "botsort"}:
+            raise ValueError(f"Unsupported Ultralytics tracker: {backend_name}")
+        if max_missed_frames < 0:
+            raise ValueError("max_missed_frames cannot be negative")
+        if not 0.0 < authorization_iou_threshold <= 1.0:
+            raise ValueError("authorization_iou_threshold must be in (0, 1]")
+        if track_buffer < 1:
+            raise ValueError("track_buffer must be at least 1")
+        cache = (Path.cwd() / ".cache" / "ultralytics").resolve()
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("YOLO_CONFIG_DIR", str(cache))
+        try:
+            from ultralytics.trackers.bot_sort import BOTSORT
+            from ultralytics.trackers.byte_tracker import BYTETracker
+        except ImportError as error:
+            raise RuntimeError(
+                "Ultralytics tracking requires ultralytics and lap. Reinstall project dependencies."
+            ) from error
+        settings = SimpleNamespace(
+            tracker_type=backend_name,
+            track_high_thresh=0.25,
+            track_low_thresh=0.10,
+            new_track_thresh=0.25,
+            track_buffer=int(track_buffer),
+            match_thresh=0.80,
+            fuse_score=True,
+            gmc_method="sparseOptFlow",
+            proximity_thresh=0.50,
+            appearance_thresh=0.80,
+            with_reid=False,
+            model="auto",
+            device=None,
+        )
+        tracker_type = BYTETracker if backend_name == "bytetrack" else BOTSORT
+        self.backend = tracker_type(settings)
+        self.backend_name = backend_name
+        self.backend_version = version("ultralytics")
+        self.backend_settings = {
+            "track_high_thresh": settings.track_high_thresh,
+            "track_low_thresh": settings.track_low_thresh,
+            "new_track_thresh": settings.new_track_thresh,
+            "track_buffer": settings.track_buffer,
+            "match_thresh": settings.match_thresh,
+            "fuse_score": settings.fuse_score,
+            "gmc_method": settings.gmc_method if backend_name == "botsort" else None,
+            "with_reid": settings.with_reid if backend_name == "botsort" else None,
+        }
+        self.max_missed_frames = int(max_missed_frames)
+        self.authorization_iou_threshold = float(authorization_iou_threshold)
+        self.overlap_uncertainty_threshold = float(overlap_uncertainty_threshold)
+        self.tracks: dict[int, FaceTrack] = {}
+        self.created_tracks = 0
+        self.expired_tracks = 0
+        self.revocations = 0
+
+    def _new_track(
+        self,
+        track_id: int,
+        detection: np.ndarray,
+        frame_index: int,
+        detection_index: int,
+    ) -> FaceTrack:
+        track = FaceTrack(
+            track_id=track_id,
+            detection=np.asarray(detection, dtype=np.float32).copy(),
+            created_frame=frame_index,
+            detection_index=detection_index,
+        )
+        self.tracks[track_id] = track
+        self.created_tracks += 1
+        return track
+
+    def update(
+        self,
+        detections: np.ndarray,
+        frame_index: int,
+        frame: np.ndarray | None = None,
+    ) -> list[FaceTrack]:
+        boxes = np.asarray(detections, dtype=np.float32)
+        if boxes.size == 0:
+            boxes = np.empty((0, 5), dtype=np.float32)
+        if boxes.ndim != 2 or boxes.shape[1] < 5:
+            raise ValueError(f"Expected Nx5 detections, got {boxes.shape}")
+        for track in self.tracks.values():
+            track.detection_index = None
+            track.overlap_uncertain = False
+        rows = np.asarray(
+            self.backend.update(_UltralyticsDetections(boxes), img=frame),
+            dtype=np.float32,
+        )
+        if rows.size == 0:
+            rows = np.empty((0, 8), dtype=np.float32)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        visible_tracks: list[FaceTrack] = []
+        visible_ids: set[int] = set()
+        for row in rows:
+            track_id = int(row[4])
+            detection_index = int(row[-1])
+            if not 0 <= detection_index < len(boxes):
+                continue
+            detection = boxes[detection_index]
+            track = self.tracks.get(track_id)
+            if track is None:
+                track = self._new_track(
+                    track_id,
+                    detection,
+                    frame_index,
+                    detection_index,
+                )
+            else:
+                overlap = intersection_over_union(track.detection, detection)
+                track.detection_index = detection_index
+                if track.update_geometry(
+                    detection,
+                    overlap,
+                    self.authorization_iou_threshold,
+                    False,
+                ):
+                    self.revocations += 1
+            visible_ids.add(track_id)
+            visible_tracks.append(track)
+        for track_id, track in list(self.tracks.items()):
+            if track_id in visible_ids:
+                continue
+            if track.mark_missed():
+                self.revocations += 1
+            if track.missed_frames > self.max_missed_frames:
+                del self.tracks[track_id]
+                self.expired_tracks += 1
+        for first_index, first in enumerate(visible_tracks):
+            for second in visible_tracks[first_index + 1 :]:
+                if (
+                    intersection_over_union(first.detection, second.detection)
+                    <= self.overlap_uncertainty_threshold
+                ):
+                    continue
+                if first.mark_uncertain():
+                    self.revocations += 1
+                if second.mark_uncertain():
+                    self.revocations += 1
+                first.overlap_uncertain = True
+                second.overlap_uncertain = True
+        return visible_tracks
+
+
+def create_face_tracker(
+    backend_name: str,
+    iou_threshold: float,
+    max_missed_frames: int,
+    authorization_iou_threshold: float,
+    track_buffer: int,
+) -> FaceTracker | UltralyticsFaceTracker:
+    if backend_name == "iou":
+        return FaceTracker(
+            iou_threshold=iou_threshold,
+            max_missed_frames=max_missed_frames,
+            authorization_iou_threshold=authorization_iou_threshold,
+        )
+    return UltralyticsFaceTracker(
+        backend_name=backend_name,
+        max_missed_frames=max_missed_frames,
+        authorization_iou_threshold=authorization_iou_threshold,
+        track_buffer=track_buffer,
+    )

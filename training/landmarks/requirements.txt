@@ -1,0 +1,9 @@
+ultralytics==8.4.120
+torch>=2.4,<3
+torchvision>=0.19,<1
+numpy>=1.26,<3
+opencv-python>=4.10,<5
+Pillow>=10,<13
+PyYAML>=6,<7
+onnx>=1.16,<2
+onnxslim>=0.1.82
