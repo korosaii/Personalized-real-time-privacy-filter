@@ -231,8 +231,13 @@ def main() -> None:
         f"Template embeddings: {len(template.embeddings)} "
         f"({len(accepted)} photos x {len(rotation_angles)} orientation(s))"
     )
-    print(f"Rotation centroids: {len(template.rotation_centroids)}")
-    print(f"Rotation angles: {list(rotation_angles)} degrees")
+    print(
+        "Rotation centroid indices: "
+        + ", ".join(
+            f"{index}={angle}deg"
+            for index, angle in enumerate(template.rotation_angles)
+        )
+    )
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
     if len(accepted) == 1:

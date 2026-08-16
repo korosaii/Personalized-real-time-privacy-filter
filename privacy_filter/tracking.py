@@ -40,6 +40,8 @@ class FaceTrack:
     created_frame: int
     state: FaceState = FaceState.PENDING
     score: float | None = None
+    matching_centroid_index: int | None = None
+    matching_rotation_angle: int | None = None
     positive_streak: int = 0
     unknown_attempts: int = 0
     last_recognition_frame: int | None = None
@@ -52,6 +54,13 @@ class FaceTrack:
     stable_matches: int = 0
     overlap_uncertain: bool = False
     recognition_block_reason: str | None = None
+    lighting_mode: str = "UNKNOWN"
+    lighting_ambient_median: float | None = None
+    lighting_face_p10: float | None = None
+    lighting_face_p90: float | None = None
+    lighting_face_black_ratio: float | None = None
+    lighting_face_white_ratio: float | None = None
+    lighting_effective_threshold: float | None = None
     detection_index: int | None = None
     velocity: np.ndarray = field(
         default_factory=lambda: np.zeros(4, dtype=np.float32)
@@ -70,6 +79,8 @@ class FaceTrack:
     def revoke(self, state: FaceState = FaceState.PENDING) -> None:
         self.state = state
         self.score = None
+        self.matching_centroid_index = None
+        self.matching_rotation_angle = None
         self.positive_streak = 0
         self.unknown_attempts = 0
         self.last_positive_frame = None
@@ -203,11 +214,19 @@ class FaceTrack:
         threshold: float,
         confirmations: int,
         frame_index: int,
+        matching_centroid_index: int | None = None,
+        matching_rotation_angle: int | None = None,
     ) -> tuple[FaceState, FaceState]:
         previous = self.state
         self.last_recognition_frame = frame_index
         self.verification_required = False
         self.score = None if score is None else float(score)
+        self.matching_centroid_index = (
+            None if score is None else matching_centroid_index
+        )
+        self.matching_rotation_angle = (
+            None if score is None else matching_rotation_angle
+        )
         if score is None or score < threshold:
             self.unknown_attempts = (
                 self.unknown_attempts + 1 if previous is FaceState.UNKNOWN else 1

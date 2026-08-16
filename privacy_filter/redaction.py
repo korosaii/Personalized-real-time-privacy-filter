@@ -4,20 +4,12 @@ import cv2
 import numpy as np
 
 
-def expand_box(
+def _clip_box(
     box: np.ndarray,
     image_width: int,
     image_height: int,
-    padding: float,
 ) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = (float(value) for value in box[:4])
-    width = max(0.0, x2 - x1)
-    height = max(0.0, y2 - y1)
-    x1 -= width * padding
-    x2 += width * padding
-    y1 -= height * padding
-    y2 += height * padding
-
     return (
         max(0, min(image_width, int(np.floor(x1)))),
         max(0, min(image_height, int(np.floor(y1)))),
@@ -40,21 +32,35 @@ def _pixelate(region: np.ndarray) -> np.ndarray:
 def pixelate_faces(
     frame: np.ndarray,
     detections: np.ndarray,
-    padding: float = 0.18,
 ) -> np.ndarray:
     output = frame.copy()
     image_height, image_width = output.shape[:2]
 
     for detection in detections:
-        x1, y1, x2, y2 = expand_box(
+        x1, y1, x2, y2 = _clip_box(
             detection,
             image_width=image_width,
             image_height=image_height,
-            padding=padding,
         )
         if x2 <= x1 or y2 <= y1:
             continue
-        output[y1:y2, x1:x2] = _pixelate(output[y1:y2, x1:x2])
+
+        region = output[y1:y2, x1:x2]
+        pixelated = _pixelate(region)
+        region_height, region_width = region.shape[:2]
+        mask = np.zeros((region_height, region_width), dtype=np.uint8)
+        cv2.ellipse(
+            mask,
+            (region_width // 2, region_height // 2),
+            (max(1, region_width // 2), max(1, region_height // 2)),
+            0.0,
+            0.0,
+            360.0,
+            255,
+            thickness=-1,
+            lineType=cv2.LINE_8,
+        )
+        cv2.copyTo(pixelated, mask, region)
 
     return output
 
