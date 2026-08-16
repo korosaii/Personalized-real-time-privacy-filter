@@ -2,7 +2,7 @@
 
 Real-time фильтр для камеры: зарегистрированный владелец остаётся видимым, остальные обнаруженные лица скрываются пикселизацией.
 
-Проект использует YOLO11n-face, официальные трекеры Ultralytics, выбираемую IResNet recognition-модель, ONNX Runtime и OpenCV. Лендмарки и дополнительные landmark-модели не используются. На Apple Silicon автоматически используется CoreML. На Windows автоматически используется DirectML с совместимой NVIDIA, AMD или Intel GPU, а при недоступности GPU — CPU.
+Проект использует YOLO11n-face, опциональную YOLO11n-face-pose с пятью лендмарками, официальные трекеры Ultralytics, выбираемую IResNet recognition-модель, ONNX Runtime и OpenCV. На Apple Silicon автоматически используется CoreML. На Windows автоматически используется DirectML с совместимой NVIDIA, AMD или Intel GPU, а при недоступности GPU — CPU.
 
 ## Клонирование
 
@@ -47,14 +47,16 @@ python -m pip install -r requirements.txt
 ```text
 models/
 ├── detector/
-│   └── yolov11n-face.onnx
+│   ├── yolov11n-face.onnx
+│   ├── yolov11n-face-pose.onnx
+│   └── yolov11n-face-pose-roll90.onnx
 └── recognition/
     ├── iresnet_r34_glint360k.onnx
     ├── iresnet_r100_glint360k.onnx
     └── webface_r50.onnx
 ```
 
-Runtime использует статический YOLO11 ONNX с входом `640×640` и выбранную recognition-модель с входом `112×112`. По умолчанию используется `r34-glint360k`.
+Runtime использует статический YOLO11 ONNX с входом `640×640` и выбранную recognition-модель с входом `112×112`. Детектор `yolo11` и recognition-модель `r34-glint360k` используются по умолчанию. Детекторы `yolo11-pose` и `yolo11-pose-roll90` выдают bbox и пять точек лица за один inference. Вариант `yolo11-pose-roll90` дообучен на WIDER FACE и WFLW с поворотами до ±90°.
 
 Доступные имена моделей: `r34-glint360k`, `r100-glint360k`, `r50-webface600k`. Официальной R100@WebFace600K в InsightFace Model Zoo нет; для R100 используется Glint360K.
 
@@ -71,6 +73,18 @@ data/photos/owner/
 
 ```bash
 privacy-enroll owner data/photos/owner
+```
+
+Для регистрации с выравниванием по глазам, носу и углам рта создайте отдельный template:
+
+```bash
+privacy-enroll owner data/photos/owner --detector yolo11-pose --output data/enrollments/owner-pose.npz
+```
+
+Для честного сравнения экспериментального detector, дообученного на больших наклонах, создайте отдельный template:
+
+```bash
+privacy-enroll owner data/photos/owner --detector yolo11-pose-roll90 --output data/enrollments/owner-pose-roll90.npz
 ```
 
 Для сравнения моделей создавайте отдельный template для каждой:
@@ -99,6 +113,20 @@ Biometric template сохраняется в `data/enrollments/owner.npz`. Ис�
 ```bash
 privacy-recognize
 ```
+
+Запуск Pose-детектора требует template, созданный с тем же detector mode:
+
+```bash
+privacy-recognize --detector yolo11-pose --template data/enrollments/owner-pose.npz
+```
+
+Запуск экспериментального варианта с большими наклонами:
+
+```bash
+privacy-recognize --detector yolo11-pose-roll90 --template data/enrollments/owner-pose-roll90.npz
+```
+
+В этом режиме перед recognition лицо геометрически приводится к ArcFace `112×112` по пяти точкам. Выравнивание исправляет положение, масштаб и наклон головы в плоскости изображения. Оно не выполняет 3D-фронтализацию сильного профиля.
 
 По умолчанию используется официальный Ultralytics ByteTrack. Доступны три режима:
 

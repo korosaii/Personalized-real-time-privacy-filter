@@ -13,11 +13,17 @@ from .enrollment import (
     safe_identity_name,
     save_template,
 )
-from .model_setup import RuntimeModels, prepare_runtime_models, recognition_model_help
+from .model_setup import (
+    RuntimeModels,
+    detector_model_help,
+    prepare_runtime_models,
+    recognition_model_help,
+)
 from .ort_session import PROVIDER_CHOICES
 from .recognition import (
     FACE_PREPROCESSING,
     FACE_ROTATION_ANGLES,
+    LANDMARK_FACE_PREPROCESSING,
     FaceEmbedder,
     rotate_face,
 )
@@ -39,7 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Photographs or folders containing photographs",
     )
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--detector-model", type=Path, default=None)
+    parser.add_argument(
+        "--detector-model",
+        "--detector",
+        default="yolo11",
+        help=detector_model_help(),
+    )
     parser.add_argument(
         "--recognition-model",
         "--model",
@@ -101,6 +112,11 @@ def load_models(
     detector.detect(blank)
     embedder.warmup(2)
     print(f"Recognition model: {models.recognition_name}")
+    print(f"Detector model: {models.detector_name}")
+    print(
+        "Face preprocessing: "
+        f"{'5-point alignment' if detector.has_landmarks else 'bbox crop'}"
+    )
     print(f"Detector providers: {detector.providers}")
     print(f"Recognition providers: {embedder.providers}")
     for warning in (detector.provider_warning, embedder.provider_warning):
@@ -199,7 +215,11 @@ def main() -> None:
         model_sha256=models.recognition_source_sha256,
         threshold=args.threshold,
         source="photos",
-        face_preprocessing=FACE_PREPROCESSING,
+        face_preprocessing=(
+            LANDMARK_FACE_PREPROCESSING
+            if detector.has_landmarks
+            else FACE_PREPROCESSING
+        ),
         rotation_angles=FACE_ROTATION_ANGLES if args.rotations else (0,),
     )
     saved = save_template(template, output)

@@ -15,9 +15,18 @@ import numpy as np
 
 from .camera import Camera
 from .enrollment import load_template, sha256_file
-from .model_setup import prepare_runtime_models, recognition_model_help
+from .model_setup import (
+    detector_model_help,
+    prepare_runtime_models,
+    recognition_model_help,
+)
 from .ort_session import PROVIDER_CHOICES
-from .recognition import FACE_PREPROCESSING, FACE_ROTATION_ANGLES, FaceEmbedder
+from .recognition import (
+    FACE_PREPROCESSING,
+    FACE_ROTATION_ANGLES,
+    LANDMARK_FACE_PREPROCESSING,
+    FaceEmbedder,
+)
 from .redaction import pixelate_faces, redact_entire_frame
 from .tracking import FaceState, FaceTrack, create_face_tracker
 from .yolo import YOLOFaceDetector
@@ -41,7 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Real-time personalized face privacy filter."
     )
     parser.add_argument("--template", default="data/enrollments/owner.npz")
-    parser.add_argument("--detector-model", type=Path, default=None)
+    parser.add_argument(
+        "--detector-model",
+        "--detector",
+        default="yolo11",
+        help=detector_model_help(),
+    )
     parser.add_argument(
         "--recognition-model",
         "--model",
@@ -162,6 +176,11 @@ def _unmirror_detection(detection: np.ndarray, frame_width: int) -> np.ndarray:
     restored = np.asarray(detection, dtype=np.float32).copy()
     restored[0] = frame_width - detection[2]
     restored[2] = frame_width - detection[0]
+    if restored.size >= 20:
+        landmarks = restored[5:20].reshape(5, 3).copy()
+        landmarks[:, 0] = frame_width - 1 - landmarks[:, 0]
+        landmarks = landmarks[[1, 0, 2, 4, 3]]
+        restored[5:20] = landmarks.reshape(-1)
     return restored
 
 
@@ -322,11 +341,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "Enrollment was created with a different recognition model. "
             "Re-run privacy-enroll with the current model."
         )
-    if template.metadata.get("face_preprocessing") != FACE_PREPROCESSING:
-        raise ValueError(
-            "Enrollment was created with another face crop policy. "
-            "Re-run privacy-enroll for bbox-only recognition."
-        )
     template_angles = tuple(
         int(value) for value in template.metadata.get("rotation_angles", [0])
     )
@@ -347,6 +361,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         threshold=args.detector_threshold,
         provider=args.provider,
     )
+    face_preprocessing = (
+        LANDMARK_FACE_PREPROCESSING
+        if detector.has_landmarks
+        else FACE_PREPROCESSING
+    )
+    if template.metadata.get("face_preprocessing") != face_preprocessing:
+        mode = "yolo11-pose" if detector.has_landmarks else "yolo11"
+        raise ValueError(
+            "Enrollment preprocessing does not match the selected detector. "
+            f"Re-run privacy-enroll with --detector {mode}."
+        )
     embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
     tracker = create_face_tracker(
         backend_name=args.tracker,
@@ -361,6 +386,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_warmup = embedder.warmup(2)
     print(f"Identity: {template.name}")
     print(f"Recognition model: {models.recognition_name}")
+    print(f"Detector model: {models.detector_name}")
+    print(
+        "Face preprocessing: "
+        f"{'5-point alignment' if detector.has_landmarks else 'bbox crop'}"
+    )
     print(f"Template source photos: {template.metadata.get('source_photos', 'unknown')}")
     print(f"Template embeddings: {len(template.embeddings)}")
     print(f"Rotation centroids: {len(template.rotation_centroids)}")
@@ -669,7 +699,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 16,
+        "pipeline_version": 17,
         "identity": template.name,
         "template_samples": len(template.embeddings),
         "template_source_photos": template.metadata.get("source_photos"),
@@ -698,7 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "rotation_angles": list(template_angles),
             "template_matching_policy": "per_rotation_centroid_max",
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
-            "face_preprocessing": FACE_PREPROCESSING,
+            "face_preprocessing": face_preprocessing,
             "pipeline": "main-thread-camera_single-worker-inference",
             "pipeline_queue_depth": 1,
         },
@@ -712,6 +742,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "models": {
             "detector_source": str(models.detector_source),
             "detector_runtime": str(models.detector_runtime),
+            "detector_name": models.detector_name,
+            "detector_landmarks": detector.has_landmarks,
             "recognition_name": models.recognition_name,
             "recognition_source": str(models.recognition_source),
             "recognition_runtime": str(models.recognition_runtime),

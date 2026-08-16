@@ -10,9 +10,14 @@ import onnx
 from .ort_session import preferred_execution_provider
 
 
-DETECTOR_CANDIDATES = (
-    Path("models/detector/yolov11n-face.onnx"),
-)
+DETECTOR_MODEL_ALIASES = {
+    "yolo11": Path("models/detector/yolov11n-face.onnx"),
+    "yolo11-pose": Path("models/detector/yolov11n-face-pose.onnx"),
+    "yolo11-pose-roll90": Path(
+        "models/detector/yolov11n-face-pose-roll90.onnx"
+    ),
+}
+DEFAULT_DETECTOR_MODEL = "yolo11"
 RECOGNITION_MODEL_ALIASES = {
     "r34-glint360k": Path("models/recognition/iresnet_r34_glint360k.onnx"),
     "r100-glint360k": Path("models/recognition/iresnet_r100_glint360k.onnx"),
@@ -24,6 +29,7 @@ DEFAULT_RECOGNITION_MODEL = "r34-glint360k"
 @dataclass(frozen=True)
 class RuntimeModels:
     detector_source: Path
+    detector_name: str
     recognition_source: Path
     recognition_name: str
     detector_runtime: Path
@@ -38,22 +44,27 @@ def recognition_model_help() -> str:
     return f"Recognition model alias ({aliases}) or path to an ONNX file"
 
 
-def _resolve_model(
+def detector_model_help() -> str:
+    aliases = ", ".join(DETECTOR_MODEL_ALIASES)
+    return f"Detector model alias ({aliases}) or path to an ONNX file"
+
+
+def _resolve_detector_model(
     requested: str | Path | None,
-    candidates: tuple[Path, ...],
-    label: str,
-) -> Path:
-    if requested is not None:
-        path = Path(requested).expanduser().resolve()
+) -> tuple[Path, str]:
+    value = DEFAULT_DETECTOR_MODEL if requested is None else str(requested)
+    if value in DETECTOR_MODEL_ALIASES:
+        path = DETECTOR_MODEL_ALIASES[value].expanduser().resolve()
         if not path.is_file():
-            raise FileNotFoundError(f"{label} ONNX model not found: {path}")
-        return path
-    for candidate in candidates:
-        path = candidate.expanduser().resolve()
-        if path.is_file():
-            return path
-    expected = " or ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"{label} ONNX model not found. Expected {expected}")
+            raise FileNotFoundError(f"Detector model '{value}' not found: {path}")
+        return path, value
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        aliases = ", ".join(DETECTOR_MODEL_ALIASES)
+        raise FileNotFoundError(
+            f"Detector ONNX model not found: {path}. Available aliases: {aliases}"
+        )
+    return path, "custom"
 
 
 def _resolve_recognition_model(
@@ -166,7 +177,7 @@ def prepare_runtime_models(
     provider: str,
     cache_dir: str | Path = ".cache/models",
 ) -> RuntimeModels:
-    detector_source = _resolve_model(detector_model, DETECTOR_CANDIDATES, "Detector")
+    detector_source, detector_name = _resolve_detector_model(detector_model)
     recognition_source, recognition_name = _resolve_recognition_model(
         recognition_model
     )
@@ -193,6 +204,7 @@ def prepare_runtime_models(
     )
     return RuntimeModels(
         detector_source=detector_source,
+        detector_name=detector_name,
         recognition_source=recognition_source,
         recognition_name=recognition_name,
         detector_runtime=detector_runtime,
