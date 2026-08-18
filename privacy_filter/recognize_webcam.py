@@ -33,6 +33,7 @@ from .recognition import (
 )
 from .redaction import pixelate_faces, redact_entire_frame
 from .tracking import FaceState, FaceTrack, create_face_tracker
+from .virtual_camera import VirtualCameraSink, virtual_camera_fps
 from .yolo import YOLOFaceDetector
 
 
@@ -433,6 +434,14 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Show the processed stream in a window; enabled by default",
+    )
+    parser.add_argument(
+        "--virtual-camera",
+        action="store_true",
+        help=(
+            "Publish processed frames as a virtual webcam; requires the "
+            "virtual-camera extra and a supported device such as OBS Virtual Camera"
+        ),
     )
     parser.add_argument(
         "--rotations",
@@ -1004,6 +1013,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         print(f"Recording: {output_path} ({output_size[0]}x{output_size[1]})")
     else:
         print("Recording: disabled")
+    virtual_camera: VirtualCameraSink | None = None
+    if args.virtual_camera:
+        virtual_fps = virtual_camera_fps(camera.info.fps, args.camera_fps)
+        virtual_camera = VirtualCameraSink(
+            camera.info.width,
+            camera.info.height,
+            virtual_fps,
+        )
+        print(
+            f"Virtual camera: {virtual_camera.device} "
+            f"({camera.info.width}x{camera.info.height} at {virtual_fps:.1f} FPS)"
+        )
+    else:
+        print("Virtual camera: disabled")
     started = perf_counter()
     recording_started = started
     rolling_ms: deque[float] = deque(maxlen=120)
@@ -1337,6 +1360,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 args.authorized_recheck_interval,
                 args.minimum_recognition_face_size,
             )
+            if virtual_camera is not None:
+                virtual_camera.submit(processed.output)
             if writer is not None:
                 recorded = processed.output
                 if (recorded.shape[1], recorded.shape[0]) != output_size:
@@ -1377,6 +1402,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             pending.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
         camera.close()
+        if virtual_camera is not None:
+            virtual_camera.close()
         if writer is not None:
             writer.release()
             if temporary_output_path is not None and output_path is not None:
@@ -1438,6 +1465,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "tracker_settings": tracker.backend_settings,
             "mirror": args.mirror,
             "preview": args.preview,
+            "virtual_camera": args.virtual_camera,
+            "virtual_camera_device": (
+                virtual_camera.device if virtual_camera is not None else None
+            ),
             "realtime_video": args.realtime_video,
             "rotations": args.rotations,
             "rotation_angles": list(template_angles),
@@ -1553,6 +1584,11 @@ def main() -> None:
             )
         if args.video_output_size is not None and args.video_output is None:
             raise ValueError("--video-output-size requires --video-output")
+        if args.offline_video and args.virtual_camera:
+            raise ValueError(
+                "--virtual-camera is supported only by the realtime face and "
+                "image-prompt pipelines"
+            )
         if args.offline_video:
             if args.video_path is None:
                 raise ValueError("--video-path is required with --offline-video")
@@ -1611,6 +1647,7 @@ def main() -> None:
                 camera_fps=args.camera_fps,
                 mirror=args.mirror,
                 preview=args.preview,
+                virtual_camera=args.virtual_camera,
                 max_frames=args.max_frames,
                 benchmark_path=Path(args.benchmark_out) if args.benchmark_out else None,
                 yolo_model_id=args.image_yolo_model,

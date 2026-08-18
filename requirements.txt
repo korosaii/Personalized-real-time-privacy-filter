@@ -1,1 +1,1 @@
--e .[grounded-video,image-prompt]
+-e .[grounded-video,image-prompt,virtual-camera]

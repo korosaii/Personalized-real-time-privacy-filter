@@ -17,6 +17,7 @@ import numpy as np
 
 from .camera import Camera, VideoFile
 from .redaction import blur_entire_frame, blur_mask, pixelate_mask, redact_entire_frame
+from .virtual_camera import VirtualCameraSink, virtual_camera_fps
 
 
 WINDOW_TITLE = "YOLOE image-prompt privacy filter (Q/Esc to quit)"
@@ -1344,6 +1345,7 @@ def process_image_prompt_stream(
     camera_fps: float,
     mirror: bool,
     preview: bool,
+    virtual_camera: bool,
     max_frames: int,
     benchmark_path: Path | None,
     yolo_model_id: str,
@@ -1463,6 +1465,7 @@ def process_image_prompt_stream(
     writer: cv2.VideoWriter | None = None
     temporary_path: Path | None = None
     final_path: Path | None = None
+    virtual_sink: VirtualCameraSink | None = None
     frames = 0
     keyframes = 0
     failures = 0
@@ -1482,6 +1485,17 @@ def process_image_prompt_stream(
                 output_path,
                 output_fps,
                 frame_size,
+            )
+        if virtual_camera:
+            sink_fps = virtual_camera_fps(source.info.fps, camera_fps)
+            virtual_sink = VirtualCameraSink(
+                source.info.width,
+                source.info.height,
+                sink_fps,
+            )
+            print(
+                f"Virtual camera: {virtual_sink.device} "
+                f"({source.info.width}x{source.info.height} at {sink_fps:.1f} FPS)"
             )
         while max_frames == 0 or frames < max_frames:
             frame = source.read()
@@ -1531,6 +1545,8 @@ def process_image_prompt_stream(
                     runtime=pipeline.runtime,
                     error=frame_error,
                 )
+            if virtual_sink is not None:
+                virtual_sink.submit(output)
             if writer is not None:
                 encoded = (
                     cv2.resize(output, output_size, interpolation=cv2.INTER_LINEAR)
@@ -1546,6 +1562,8 @@ def process_image_prompt_stream(
         completed = True
     finally:
         source.close()
+        if virtual_sink is not None:
+            virtual_sink.close()
         if writer is not None:
             writer.release()
         if preview:
@@ -1558,6 +1576,10 @@ def process_image_prompt_stream(
         "mode": f"image-prompt-yoloe-{pipeline.tracker_mode}",
         "source": str(video_path.resolve()) if video_path is not None else f"camera:{camera_index}",
         "output": str(final_path) if final_path is not None else None,
+        "virtual_camera": virtual_camera,
+        "virtual_camera_device": (
+            virtual_sink.device if virtual_sink is not None else None
+        ),
         "reference_images": [str(path) for path in paths],
         "reference_groups": [
             [str(path) for path in group] for group in reference_groups

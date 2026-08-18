@@ -34,6 +34,9 @@ image-prompt = [
   "pillow>=10,<13",
   "SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
 ]
+virtual-camera = [
+  "pyvirtualcam>=0.15,<0.16",
+]
 
 [project.scripts]
 privacy-enroll = "privacy_filter.enroll_cli:main"

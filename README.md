@@ -44,6 +44,7 @@ python -m pip install -r requirements.txt
 | Режим | Команда установки |
 |---|---|
 | Только face detection/tracking/recognition | `python -m pip install -e .` |
+| Face + виртуальная веб-камера | `python -m pip install -e ".[virtual-camera]"` |
 | Face + offline text-prompt | `python -m pip install -e ".[grounded-video]"` |
 | Face + realtime image-prompt | `python -m pip install -e ".[image-prompt]"` |
 | Все режимы | `python -m pip install -r requirements.txt` |
@@ -300,6 +301,58 @@ privacy-recognize --enrollment-has-difficult-lighting
 
 Завершение: `Q`, `Esc` или `Ctrl+C`. Последний benchmark сохраняется локально в `benchmarks/latest.json`.
 
+## Виртуальная веб-камера
+
+Флаг `--virtual-camera` публикует уже обработанные кадры как отдельную веб-камеру.
+Исходное неотредактированное изображение в виртуальное устройство не передаётся:
+до готовности первого результата выводится чёрный кадр, а между результатами
+повторяется последний обработанный кадр. Preview и запись MP4 можно включать или
+выключать независимо.
+
+При установке через `requirements.txt` поддержка уже включена. Для минимальной
+face-only установки добавьте extra отдельно:
+
+```powershell
+python -m pip install -e ".[virtual-camera]"
+```
+
+На Windows сначала установите OBS Studio: `pyvirtualcam` использует установленное
+устройство **OBS Virtual Camera**. Запускать виртуальную камеру кнопкой OBS не
+нужно; OBS лучше закрыть, чтобы устройство не было занято. Если устройство не
+появилось, установите его по официальной инструкции OBS и перезапустите приложение,
+в котором будете выбирать камеру.
+
+Face privacy как виртуальная веб-камера:
+
+```powershell
+privacy-recognize --virtual-camera --no-preview
+```
+
+Image-prompt pipeline как виртуальная веб-камера:
+
+```powershell
+privacy-recognize --image-prompt-video `
+  --reference-image data/references/object.jpg `
+  --virtual-camera `
+  --no-preview
+```
+
+После запуска выберите **OBS Virtual Camera** в Zoom, Discord, браузере или другой
+программе. Разрешение виртуальной камеры совпадает с фактическим разрешением
+источника; для веб-камеры оно запрашивается через `--width` и `--height`. FPS
+берётся из источника, а если backend его не сообщает — из `--camera-fps`.
+
+Можно одновременно сохранить результат:
+
+```powershell
+privacy-recognize --virtual-camera `
+  --video-output data/videos/webcam.redacted.mp4 `
+  --no-preview
+```
+
+Флаг работает с face privacy, `--realtime-video` и `--image-prompt-video`. Offline
+text-prompt pipeline не является realtime и с `--virtual-camera` не запускается.
+
 Дополнительные параметры:
 
 ```bash
@@ -361,6 +414,7 @@ inspect-models --help
 | `--video-output-size` | исходный размер | Финальный `WIDTHxHEIGHT`; не меняет model input. |
 | `--mirror` / `--no-mirror` | камера: on, файл: off | Отражение входных кадров. |
 | `--preview` / `--no-preview` | включён | Окно с обработанным потоком. |
+| `--virtual-camera` | выключен | Публиковать обработанный поток как виртуальную веб-камеру. |
 | `--max-frames` | `0` | Лимит кадров; `0` означает без ограничения. |
 | `--benchmark-out` | `benchmarks/latest.json` | JSON runtime-метрик и настроек. |
 
@@ -569,7 +623,7 @@ realtime. Для оценки реальной системы используй
 Выходной MP4, как и в других режимах, создаётся без аудиодорожки.
 Общие флаги источника и вывода (`--video-path`, `--video-output`,
 `--video-output-size`, `--camera`, `--width`, `--height`, `--camera-fps`,
-`--mirror`, `--preview`, `--max-frames`, `--benchmark-out`) работают и в этом
+`--mirror`, `--preview`, `--virtual-camera`, `--max-frames`, `--benchmark-out`) работают и в этом
 режиме. Для входного видео `--video-output` обязателен; для камеры запись можно
 не включать.
 
