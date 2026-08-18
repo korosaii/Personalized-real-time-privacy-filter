@@ -40,6 +40,8 @@ class FaceTrack:
     created_frame: int
     state: FaceState = FaceState.PENDING
     score: float | None = None
+    identity_name: str | None = None
+    matching_template_index: int | None = None
     matching_centroid_index: int | None = None
     matching_rotation_angle: int | None = None
     positive_streak: int = 0
@@ -79,6 +81,8 @@ class FaceTrack:
     def revoke(self, state: FaceState = FaceState.PENDING) -> None:
         self.state = state
         self.score = None
+        self.identity_name = None
+        self.matching_template_index = None
         self.matching_centroid_index = None
         self.matching_rotation_angle = None
         self.positive_streak = 0
@@ -216,11 +220,17 @@ class FaceTrack:
         frame_index: int,
         matching_centroid_index: int | None = None,
         matching_rotation_angle: int | None = None,
+        identity_name: str | None = None,
+        matching_template_index: int | None = None,
     ) -> tuple[FaceState, FaceState]:
         previous = self.state
         self.last_recognition_frame = frame_index
         self.verification_required = False
         self.score = None if score is None else float(score)
+        previous_identity = self.identity_name
+        self.matching_template_index = (
+            None if score is None else matching_template_index
+        )
         self.matching_centroid_index = (
             None if score is None else matching_centroid_index
         )
@@ -228,6 +238,8 @@ class FaceTrack:
             None if score is None else matching_rotation_angle
         )
         if score is None or score < threshold:
+            self.identity_name = None
+            self.matching_template_index = None
             self.unknown_attempts = (
                 self.unknown_attempts + 1 if previous is FaceState.UNKNOWN else 1
             )
@@ -238,6 +250,11 @@ class FaceTrack:
 
         self.unknown_attempts = 0
         self.last_positive_frame = frame_index
+        if previous_identity is not None and previous_identity != identity_name:
+            self.positive_streak = 0
+            if previous is FaceState.AUTHORIZED:
+                self.state = FaceState.PENDING
+        self.identity_name = identity_name
         self.positive_streak = min(confirmations, self.positive_streak + 1)
         if self.positive_streak >= confirmations:
             self.state = FaceState.AUTHORIZED

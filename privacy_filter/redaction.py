@@ -65,6 +65,78 @@ def pixelate_faces(
     return output
 
 
+def pixelate_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    block_size: int = 16,
+) -> np.ndarray:
+    """Pixelate only pixels selected by a full-frame boolean mask."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if mask.shape != frame.shape[:2]:
+        raise ValueError(
+            f"mask shape {mask.shape} does not match frame shape {frame.shape[:2]}"
+        )
+
+    selected = np.asarray(mask, dtype=bool)
+    if not np.any(selected):
+        return frame.copy()
+
+    height, width = frame.shape[:2]
+    small_width = max(1, (width + block_size - 1) // block_size)
+    small_height = max(1, (height + block_size - 1) // block_size)
+    reduced = cv2.resize(
+        frame,
+        (small_width, small_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    pixelated = cv2.resize(
+        reduced,
+        (width, height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    output = frame.copy()
+    output[selected] = pixelated[selected]
+    return output
+
+
+def blur_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    kernel_size: int = 51,
+) -> np.ndarray:
+    """Apply a true Gaussian blur only to pixels selected by a full-frame mask."""
+    if kernel_size <= 1:
+        raise ValueError("kernel_size must be greater than 1")
+    if mask.shape != frame.shape[:2]:
+        raise ValueError(
+            f"mask shape {mask.shape} does not match frame shape {frame.shape[:2]}"
+        )
+    selected = np.asarray(mask, dtype=bool)
+    if not np.any(selected):
+        return frame.copy()
+
+    maximum = min(frame.shape[:2])
+    maximum = maximum if maximum % 2 == 1 else maximum - 1
+    effective_size = min(kernel_size, maximum)
+    effective_size = effective_size if effective_size % 2 == 1 else effective_size + 1
+    effective_size = max(3, effective_size)
+    blurred = cv2.GaussianBlur(
+        frame,
+        (effective_size, effective_size),
+        sigmaX=0.0,
+        sigmaY=0.0,
+    )
+    output = frame.copy()
+    output[selected] = blurred[selected]
+    return output
+
+
+def blur_entire_frame(frame: np.ndarray, kernel_size: int = 51) -> np.ndarray:
+    mask = np.ones(frame.shape[:2], dtype=bool)
+    return blur_mask(frame, mask, kernel_size)
+
+
 def redact_entire_frame(frame: np.ndarray) -> np.ndarray:
     height, width = frame.shape[:2]
     reduced = cv2.resize(frame, (16, 16), interpolation=cv2.INTER_AREA)

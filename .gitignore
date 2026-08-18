@@ -11,6 +11,7 @@ tests/
 models/**/*.onnx
 models/**/*.pth
 models/**/*.pt
+models/edgetam/
 
 benchmarks/*.json
 benchmarks/*.csv
@@ -22,5 +23,13 @@ data/photos/**
 !data/photos/
 !data/photos/owner/
 !data/photos/owner/.gitkeep
+data/references/**
+!data/references/
+!data/references/.gitkeep
+
+# Local ChokePoint dataset extracts and annotations.
+data/P1E/
+data/P1E_S1/
+data/groundtruth/
 
 *.mp4

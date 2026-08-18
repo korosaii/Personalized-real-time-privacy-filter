@@ -10,6 +10,7 @@ import numpy as np
 from .enrollment import (
     assess_face_quality,
     build_template,
+    load_template,
     safe_identity_name,
     save_template,
 )
@@ -166,19 +167,20 @@ def is_new_sample(candidate: np.ndarray, accepted: list[np.ndarray]) -> bool:
     return float(similarities.max()) < 0.9999
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    if not 0.0 < args.threshold < 1.0:
-        raise SystemExit("--threshold must be between 0 and 1")
-    photos = expand_photos(args.photos)
-    if not photos:
-        raise SystemExit(
-            "No supported photographs found. Use JPG, JPEG, PNG, WEBP, BMP, TIFF, "
-            "or a folder containing those files."
-        )
-    print(f"Found {len(photos)} photograph(s). Raw photos will not be copied.")
-
-    detector, embedder, models = load_models(args)
+def enroll_photos(
+    name: str,
+    photos: list[Path],
+    detector: YOLOFaceDetector,
+    embedder: FaceEmbedder,
+    models: RuntimeModels,
+    output: Path,
+    *,
+    threshold: float = 0.35,
+    rotations: bool = False,
+    min_face_size: float = 80.0,
+    min_sharpness: float = 25.0,
+) -> tuple[Path, int, int]:
+    """Build and save one owner template with already initialized models."""
     accepted: list[np.ndarray] = []
     rejected = 0
     for path in photos:
@@ -186,9 +188,9 @@ def main() -> None:
             path,
             detector,
             embedder,
-            args.min_face_size,
-            args.min_sharpness,
-            args.rotations,
+            min_face_size,
+            min_sharpness,
+            rotations,
         )
         if embedding is None:
             rejected += 1
@@ -202,34 +204,64 @@ def main() -> None:
         print(f"ACCEPTED  {path.name}: {len(accepted)}")
 
     if not accepted:
-        raise SystemExit(
-            "No suitable owner face was found. Add at least one clear photograph "
-            "containing exactly one visible face."
+        raise ValueError(
+            f"No suitable face was found for owner '{name}'. Add at least one "
+            "clear photograph containing exactly one visible face."
         )
 
-    safe_name = safe_identity_name(args.name)
-    output = args.output or Path("data/enrollments") / f"{safe_name}.npz"
+    safe_name = safe_identity_name(name)
     template = build_template(
         safe_name,
         accepted,
         model_sha256=models.recognition_source_sha256,
-        threshold=args.threshold,
+        threshold=threshold,
         source="photos",
         face_preprocessing=(
             LANDMARK_FACE_PREPROCESSING
             if detector.has_landmarks
             else FACE_PREPROCESSING
         ),
-        rotation_angles=FACE_ROTATION_ANGLES if args.rotations else (0,),
+        rotation_angles=FACE_ROTATION_ANGLES if rotations else (0,),
     )
     saved = save_template(template, output)
+    return saved, len(accepted), rejected
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if not 0.0 < args.threshold < 1.0:
+        raise SystemExit("--threshold must be between 0 and 1")
+    photos = expand_photos(args.photos)
+    if not photos:
+        raise SystemExit(
+            "No supported photographs found. Use JPG, JPEG, PNG, WEBP, BMP, TIFF, "
+            "or a folder containing those files."
+        )
+    print(f"Found {len(photos)} photograph(s). Raw photos will not be copied.")
+
+    detector, embedder, models = load_models(args)
+    safe_name = safe_identity_name(args.name)
+    output = args.output or Path("data/enrollments") / f"{safe_name}.npz"
+    saved, accepted_count, rejected = enroll_photos(
+        safe_name,
+        photos,
+        detector,
+        embedder,
+        models,
+        output,
+        threshold=args.threshold,
+        rotations=args.rotations,
+        min_face_size=args.min_face_size,
+        min_sharpness=args.min_sharpness,
+    )
+    template = load_template(saved)
     print()
     print(f"Template saved: {saved}")
-    print(f"Accepted photos: {len(accepted)}; rejected: {rejected}")
+    print(f"Accepted photos: {accepted_count}; rejected: {rejected}")
     rotation_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
     print(
         f"Template embeddings: {len(template.embeddings)} "
-        f"({len(accepted)} photos x {len(rotation_angles)} orientation(s))"
+        f"({accepted_count} photos x {len(rotation_angles)} orientation(s))"
     )
     print(
         "Rotation centroid indices: "
@@ -242,7 +274,7 @@ def main() -> None:
     print(f"Rotation angles: {list(rotation_angles)} degrees")
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
-    if len(accepted) == 1:
+    if accepted_count == 1:
         print(
             "Warning: the template contains one photo. It will work, but additional "
             "poses and lighting conditions usually improve recognition stability."

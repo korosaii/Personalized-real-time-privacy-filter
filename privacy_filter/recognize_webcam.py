@@ -15,9 +15,11 @@ import cv2
 import numpy as np
 
 from .camera import Camera, VideoFile
-from .enrollment import load_template, sha256_file
+from .enrollment import load_gallery, safe_identity_name, sha256_file
+from .enroll_cli import enroll_photos, expand_photos
 from .lighting import LightingMode, classify_lighting, measure_lighting
 from .model_setup import (
+    RuntimeModels,
     detector_model_help,
     prepare_runtime_models,
     recognition_model_help,
@@ -93,7 +95,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Real-time personalized face privacy filter."
     )
-    parser.add_argument("--template", default="data/enrollments/owner.npz")
+    parser.add_argument(
+        "--template",
+        dest="templates",
+        action="append",
+        type=Path,
+        default=None,
+        help=(
+            "Owner .npz template or directory; repeat --template to authorize "
+            "multiple owners"
+        ),
+    )
+    parser.add_argument(
+        "--owners-photos-dir",
+        "--photos-dir",
+        type=Path,
+        default=Path("data/photos"),
+        help=(
+            "Directory whose immediate subdirectories contain one owner's photos "
+            "each (default: data/photos)"
+        ),
+    )
+    parser.add_argument(
+        "--auto-enroll",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Build and load owner templates from --owners-photos-dir when no "
+            "--template is supplied (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--enrollments-dir",
+        type=Path,
+        default=Path("data/enrollments"),
+        help="Where automatically built owner templates are saved",
+    )
+    parser.add_argument("--enrollment-min-face-size", type=float, default=80.0)
+    parser.add_argument("--enrollment-min-sharpness", type=float, default=25.0)
     parser.add_argument(
         "--detector-model",
         "--detector",
@@ -121,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--realtime-video",
         action="store_true",
         help="Process a video file with the real-time face-recognition pipeline",
+    )
+    parser.add_argument(
+        "--image-prompt-video",
+        action="store_true",
+        help=(
+            "Use YOLOE visual prompts and EdgeTAM tracking on a video file or "
+            "the webcam"
+        ),
     )
     parser.add_argument(
         "--offline-device",
@@ -175,6 +222,206 @@ def build_parser() -> argparse.ArgumentParser:
         default="configs/sam2.1/sam2.1_hiera_s.yaml",
     )
     parser.add_argument("--video-pixel-block-size", type=int, default=16)
+    image_prompt = parser.add_argument_group("YOLOE + EdgeTAM image-prompt mode")
+    image_prompt.add_argument(
+        "--reference-image",
+        type=Path,
+        action="append",
+        default=None,
+        help=(
+            "Object image or directory; files inside one directory are views of "
+            "one class, while repeated paths create separate object classes"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-yolo-model",
+        default="models/yoloe/yoloe-26n-seg.pt",
+    )
+    image_prompt.add_argument(
+        "--image-yolo-onnx",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Bake the current visual prompts into a cached FP32 ONNX model; "
+            "changing references creates a new cache entry"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-edgetam-model",
+        default="yonigozlan/EdgeTAM-hf",
+        help=(
+            "Transformers-compatible EdgeTAM model ID or local directory; "
+            "facebook/EdgeTAM main contains only the original checkpoint"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="auto selects CUDA, then Apple MPS, then CPU",
+    )
+    image_prompt.add_argument(
+        "--image-precision",
+        choices=("auto", "fp32", "fp16", "bf16"),
+        default="auto",
+        help="auto uses BF16/FP16 on GPU and FP32 on CPU",
+    )
+    image_prompt.add_argument(
+        "--image-yolo-imgsz",
+        type=int,
+        default=640,
+        help="Square YOLOE input for stream frames; must be divisible by 32",
+    )
+    image_prompt.add_argument(
+        "--image-yolo-reference-imgsz",
+        type=int,
+        default=640,
+        help="Square YOLOE input used once to encode the reference gallery",
+    )
+    image_prompt.add_argument(
+        "--image-edgetam-imgsz",
+        type=int,
+        default=1024,
+        help=(
+            "Square EdgeTAM input from 256 to 1024, divisible by 64; "
+            "lower values are faster but reduce mask quality"
+        ),
+    )
+    image_prompt.add_argument("--image-reference-size", type=int, default=1280)
+    image_prompt.add_argument(
+        "--image-reference-sam",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run SAM 2 once at startup to remove reference backgrounds; disable "
+            "with --no-image-reference-sam for already isolated crops"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-reference-sam-model",
+        default="facebook/sam2.1-hiera-tiny",
+        help="Small SAM 2 model used only during reference preprocessing",
+    )
+    image_prompt.add_argument(
+        "--image-reference-sam-points",
+        type=int,
+        default=8,
+        help=(
+            "Automatic SAM point-grid side; cost grows quadratically (8 is the "
+            "low-latency default)"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-reference-sam-min-area-ratio",
+        type=float,
+        default=0.01,
+        help="Reject SAM reference masks smaller than this image fraction",
+    )
+    image_prompt.add_argument(
+        "--image-reference-sam-max-area-ratio",
+        type=float,
+        default=0.98,
+        help="Reject SAM reference masks larger than this image fraction",
+    )
+    image_prompt.add_argument("--image-yolo-confidence", type=float, default=0.10)
+    image_prompt.add_argument("--image-yolo-iou", type=float, default=0.50)
+    image_prompt.add_argument(
+        "--image-edgetam-score-threshold",
+        type=float,
+        default=0.50,
+        help="Minimum sigmoid object-presence score from EdgeTAM",
+    )
+    image_prompt.add_argument(
+        "--image-mask-threshold",
+        type=float,
+        default=0.0,
+        help="EdgeTAM mask-logit threshold; 0.0 corresponds to probability 0.5",
+    )
+    image_prompt.add_argument("--image-min-mask-area", type=int, default=64)
+    image_prompt.add_argument(
+        "--image-max-mask-area-ratio",
+        type=float,
+        default=0.98,
+        help=(
+            "Reject an EdgeTAM mask covering more than this fraction of the frame; "
+            "prevents accidental full-frame redaction"
+        ),
+    )
+    image_prompt.add_argument("--image-max-objects", type=int, default=20)
+    image_prompt.add_argument(
+        "--image-redetect-interval",
+        type=int,
+        default=5,
+        help="Run YOLOE every N frames; EdgeTAM tracks between keyframes",
+    )
+    image_prompt.add_argument(
+        "--image-tracker",
+        choices=("auto", "edgetam", "iou"),
+        default="auto",
+        help=(
+            "auto uses IoU on CPU and EdgeTAM on CUDA/MPS; iou runs YOLOE-seg "
+            "on every frame without loading EdgeTAM"
+        ),
+    )
+    image_prompt.add_argument(
+        "--no-image-tracker",
+        dest="image_tracker",
+        action="store_const",
+        const="iou",
+        default=argparse.SUPPRESS,
+        help="Disable EdgeTAM and use lightweight IoU association",
+    )
+    image_prompt.add_argument(
+        "--image-iou-threshold",
+        type=float,
+        default=0.30,
+        help="Minimum bbox IoU for keeping the same lightweight track ID",
+    )
+    image_prompt.add_argument(
+        "--image-iou-max-missed",
+        type=int,
+        default=1,
+        help="Keep the last YOLOE mask for this many missed frames in IoU mode",
+    )
+    image_prompt.add_argument(
+        "--image-mask-dilation",
+        type=int,
+        default=5,
+        help="Expand the final mask by this many pixels to cover boundaries",
+    )
+    image_prompt.add_argument(
+        "--image-fallback-frames",
+        type=int,
+        default=3,
+        help="Reuse the last valid mask for this many temporarily lost frames",
+    )
+    image_prompt.add_argument("--image-pixel-block-size", type=int, default=16)
+    image_prompt.add_argument(
+        "--image-redaction",
+        choices=("blur", "pixelate"),
+        default="blur",
+        help="Redaction effect for image-prompt masks; default is true Gaussian blur",
+    )
+    image_prompt.add_argument(
+        "--image-blur-kernel-size",
+        type=int,
+        default=51,
+        help="Gaussian blur kernel size; even values are rounded to the next odd value",
+    )
+    image_prompt.add_argument(
+        "--image-fail-closed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pixelate the entire frame when inference raises an error",
+    )
+    image_prompt.add_argument(
+        "--image-diagnostic-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Draw rolling FPS and YOLOE/EdgeTAM values above every tracked object"
+        ),
+    )
     parser.add_argument(
         "--mirror",
         action=argparse.BooleanOptionalAction,
@@ -203,9 +450,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--minimum-recognition-face-size",
+        "--minimum-owner-face-size",
+        dest="minimum_recognition_face_size",
         type=float,
         default=80.0,
-        help="Minimum bbox side in pixels before recognition is attempted",
+        help=(
+            "Minimum bbox side in pixels before a face can be recognized as an "
+            "owner; smaller faces remain hidden"
+        ),
     )
     parser.add_argument(
         "--minimum-authorized-face-size",
@@ -363,7 +615,6 @@ def _authorization_size_requires_revoke(
 def _draw_label(
     frame: np.ndarray,
     track: FaceTrack,
-    identity: str,
     confirmations: int,
     minimum_face_size: float,
 ) -> None:
@@ -375,7 +626,7 @@ def _draw_label(
     y2 = max(0, min(height - 1, int(detection[3])))
     if track.state is FaceState.AUTHORIZED:
         color = (70, 230, 70)
-        label = f"#{track.track_id} {identity}"
+        label = f"#{track.track_id} {track.identity_name or 'OWNER'}"
     elif track.recognition_block_reason == "face_near_frame_edge":
         color = (40, 210, 255)
         label = f"#{track.track_id} WAIT FULL FACE"
@@ -488,8 +739,77 @@ def _validate_args(args: argparse.Namespace, threshold: float) -> None:
         raise ValueError("--tracker-buffer must be at least 1")
 
 
+def discover_owner_photo_groups(root: Path) -> list[tuple[str, list[Path]]]:
+    """Return one owner and its recursively discovered photos per child folder."""
+    source = root.expanduser().resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Owners photos directory not found: {source}")
+
+    groups: list[tuple[str, list[Path]]] = []
+    seen_names: set[str] = set()
+    for owner_dir in sorted(
+        (path for path in source.iterdir() if path.is_dir()),
+        key=lambda path: path.name.casefold(),
+    ):
+        photos = expand_photos([owner_dir])
+        if not photos:
+            continue
+        owner_name = safe_identity_name(owner_dir.name)
+        normalized_name = owner_name.casefold()
+        if normalized_name in seen_names:
+            raise ValueError(
+                "Owner folder names must be unique after normalization: "
+                f"{owner_dir.name}"
+            )
+        seen_names.add(normalized_name)
+        groups.append((owner_name, photos))
+
+    if not groups:
+        raise ValueError(
+            f"No owner photo folders found in {source}. Use "
+            f"{source / '<owner-name>'} and put at least one image in it."
+        )
+    return groups
+
+
+def auto_enroll_owners(
+    args: argparse.Namespace,
+    detector: YOLOFaceDetector,
+    embedder: FaceEmbedder,
+    models: RuntimeModels,
+) -> list[Path]:
+    groups = discover_owner_photo_groups(args.owners_photos_dir)
+    output_dir = args.enrollments_dir.expanduser().resolve()
+    print(
+        f"Auto-enrollment: found {len(groups)} owner folder(s) in "
+        f"{args.owners_photos_dir.expanduser().resolve()}"
+    )
+    template_paths: list[Path] = []
+    for owner_name, photos in groups:
+        output = output_dir / f"{owner_name}.npz"
+        print()
+        print(f"Enrolling owner {owner_name}: {len(photos)} photo(s)")
+        saved, accepted, rejected = enroll_photos(
+            owner_name,
+            photos,
+            detector,
+            embedder,
+            models,
+            output,
+            threshold=0.35 if args.threshold is None else float(args.threshold),
+            rotations=args.rotations,
+            min_face_size=args.enrollment_min_face_size,
+            min_sharpness=args.enrollment_min_sharpness,
+        )
+        template_paths.append(saved)
+        print(
+            f"Owner template saved: {saved} "
+            f"(accepted: {accepted}, rejected: {rejected})"
+        )
+    return template_paths
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
-    template = load_template(args.template)
     models = prepare_runtime_models(
         args.detector_model,
         args.recognition_model,
@@ -499,53 +819,100 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         print("Preparing optimized runtime model cache:")
         for path in models.generated:
             print(f"  {path}")
-    recognition_matches = template.model_sha256 == models.recognition_source_sha256
-    if not recognition_matches and models.recognition_runtime != models.recognition_source:
-        recognition_matches = template.model_sha256 == sha256_file(
-            models.recognition_runtime
-        )
-    if not recognition_matches:
-        raise ValueError(
-            "Enrollment was created with a different recognition model. "
-            "Re-run privacy-enroll with the current model."
-        )
-    template_angles = tuple(
-        int(value) for value in template.metadata.get("rotation_angles", [0])
-    )
-    expected_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
-    if template_angles != expected_angles:
-        mode = "with --rotations" if args.rotations else "without --rotations"
-        raise ValueError(
-            f"Enrollment rotation mode does not match this launch. "
-            f"Create and select a template enrolled {mode}."
-        )
-    threshold = template.threshold if args.threshold is None else args.threshold
     if args.detector_threshold is None:
         args.detector_threshold = 0.25 if args.tracker == "iou" else 0.10
-    _validate_args(args, threshold)
-    difficult_lighting_threshold = (
-        threshold
-        if args.enrollment_has_difficult_lighting
-        else threshold + args.difficult_lighting_threshold_increase
-    )
+    if args.enrollment_min_face_size <= 0:
+        raise ValueError("--enrollment-min-face-size must be positive")
+    if args.enrollment_min_sharpness < 0:
+        raise ValueError("--enrollment-min-sharpness cannot be negative")
+    if args.threshold is not None and not 0.0 < args.threshold < 1.0:
+        raise ValueError("--threshold must be between 0 and 1")
 
     detector = YOLOFaceDetector(
         models.detector_runtime,
         threshold=args.detector_threshold,
         provider=args.provider,
     )
+    embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
+    blank = np.zeros((detector.input_size[1], detector.input_size[0], 3), dtype=np.uint8)
+    detector.detect(blank)
+    detector.detect(blank)
+    recognition_warmup = embedder.warmup(2)
+
+    if args.templates:
+        template_paths = args.templates
+        print("Auto-enrollment skipped because --template was supplied.")
+    elif args.auto_enroll:
+        template_paths = auto_enroll_owners(args, detector, embedder, models)
+    else:
+        template_paths = [args.enrollments_dir / "owner.npz"]
+    gallery = load_gallery(template_paths)
+    templates = gallery.templates
+
+    accepted_model_hashes = {models.recognition_source_sha256}
+    if models.recognition_runtime != models.recognition_source:
+        accepted_model_hashes.add(sha256_file(models.recognition_runtime))
+    mismatched_models = [
+        template.name
+        for template in templates
+        if template.model_sha256 not in accepted_model_hashes
+    ]
+    if mismatched_models:
+        raise ValueError(
+            "Enrollment was created with a different recognition model for: "
+            + ", ".join(mismatched_models)
+            + ". Re-run privacy-enroll with the current model."
+        )
+    template_angles = tuple(
+        int(value) for value in templates[0].metadata.get("rotation_angles", [0])
+    )
+    expected_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
+    mismatched_rotations = [
+        template.name
+        for template in templates
+        if tuple(
+            int(value) for value in template.metadata.get("rotation_angles", [0])
+        )
+        != expected_angles
+    ]
+    if mismatched_rotations:
+        mode = "with --rotations" if args.rotations else "without --rotations"
+        raise ValueError(
+            "Enrollment rotation mode does not match this launch for: "
+            + ", ".join(mismatched_rotations)
+            + f". Create and select templates enrolled {mode}."
+        )
+    owner_thresholds = {
+        template.name: (
+            template.threshold if args.threshold is None else float(args.threshold)
+        )
+        for template in templates
+    }
+    threshold = min(owner_thresholds.values())
+    _validate_args(args, max(owner_thresholds.values()))
+    difficult_lighting_threshold = (
+        threshold
+        if args.enrollment_has_difficult_lighting
+        else threshold + args.difficult_lighting_threshold_increase
+    )
+
     face_preprocessing = (
         LANDMARK_FACE_PREPROCESSING
         if detector.has_landmarks
         else FACE_PREPROCESSING
     )
-    if template.metadata.get("face_preprocessing") != face_preprocessing:
+    mismatched_preprocessing = [
+        template.name
+        for template in templates
+        if template.metadata.get("face_preprocessing") != face_preprocessing
+    ]
+    if mismatched_preprocessing:
         mode = "yolo11-pose" if detector.has_landmarks else "yolo11"
         raise ValueError(
-            "Enrollment preprocessing does not match the selected detector. "
-            f"Re-run privacy-enroll with --detector {mode}."
+            "Enrollment preprocessing does not match the selected detector for: "
+            + ", ".join(mismatched_preprocessing)
+            + f". Re-run privacy-enroll with --detector {mode}."
         )
-    embedder = FaceEmbedder(models.recognition_runtime, provider=args.provider)
     tracker = create_face_tracker(
         backend_name=args.tracker,
         iou_threshold=args.track_iou_threshold,
@@ -553,23 +920,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         authorization_iou_threshold=args.authorization_iou_threshold,
         track_buffer=args.tracker_buffer,
     )
-    blank = np.zeros((detector.input_size[1], detector.input_size[0], 3), dtype=np.uint8)
-    detector.detect(blank)
-    detector.detect(blank)
-    recognition_warmup = embedder.warmup(2)
-    print(f"Identity: {template.name}")
+    print(f"Authorized owners ({len(templates)}): {', '.join(gallery.names)}")
     print(f"Recognition model: {models.recognition_name}")
     print(f"Detector model: {models.detector_name}")
     print(
         "Face preprocessing: "
         f"{'5-point alignment' if detector.has_landmarks else 'bbox crop'}"
     )
-    print(f"Template source photos: {template.metadata.get('source_photos', 'unknown')}")
-    print(f"Template embeddings: {len(template.embeddings)}")
-    print(f"Rotation centroids: {len(template.rotation_centroids)}")
+    for template, path in zip(templates, gallery.paths, strict=True):
+        print(
+            f"Owner {template.name}: {template.metadata.get('source_photos', 'unknown')} "
+            f"photo(s), {len(template.embeddings)} embedding(s), "
+            f"threshold {owner_thresholds[template.name]:.3f}, {path}"
+        )
     print(f"Rotation mode: {'enabled' if args.rotations else 'disabled'}")
-    print("Template matching: maximum similarity across per-rotation centroids.")
-    print(f"Authorization threshold: {threshold:.3f}")
+    print("Template matching: maximum similarity across every owner and rotation centroid.")
+    print(
+        "Authorization thresholds: "
+        + ", ".join(
+            f"{name}={value:.3f}" for name, value in owner_thresholds.items()
+        )
+    )
     print(
         "Difficult-lighting enrollment photos: "
         f"{'yes' if args.enrollment_has_difficult_lighting else 'no'}"
@@ -654,6 +1025,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     recognition_skip_reasons: dict[str, int] = {}
     lighting_mode_observations: dict[str, int] = {}
     authorization_grants = 0
+    authorization_grants_by_owner = {name: 0 for name in gallery.names}
+    authorized_observations_by_owner = {name: 0 for name in gallery.names}
+    candidate_scores_by_owner: dict[str, list[float]] = {
+        name: [] for name in gallery.names
+    }
     state_revocations = 0
     authorized_observations = 0
     pending_observations = 0
@@ -797,8 +1173,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 frame_recognition_calls += 1
                 score: float | None = None
+                identity_name: str | None = None
+                matching_template_index: int | None = None
                 matching_centroid_index: int | None = None
                 matching_rotation_angle: int | None = None
+                # The value is irrelevant when score stays None, but it must be
+                # initialized so a failed embedding cleanly records UNKNOWN instead
+                # of escalating to a frame-level fail-closed exception.
+                effective_threshold = threshold
                 try:
                     recognition_detection = (
                         _unmirror_detection(track.detection, frame_width)
@@ -811,11 +1193,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     )
                     recognition_ms += result.latency_ms
                     recognition_call_latencies.append(result.latency_ms)
-                    (
-                        score,
-                        matching_centroid_index,
-                        matching_rotation_angle,
-                    ) = template.best_rotation_match(result.embedding)
+                    match = gallery.best_match(result.embedding, args.threshold)
+                    score = match.score
+                    identity_name = match.identity_name
+                    matching_template_index = match.template_index
+                    matching_centroid_index = match.centroid_index
+                    matching_rotation_angle = match.rotation_angle
+                    effective_threshold = match.threshold
+                    if (
+                        lighting_mode is not LightingMode.NORMAL
+                        and not args.enrollment_has_difficult_lighting
+                    ):
+                        effective_threshold += args.difficult_lighting_threshold_increase
+                    track.lighting_effective_threshold = effective_threshold
+                    candidate_scores_by_owner[identity_name].append(score)
                     if score >= effective_threshold:
                         positive_scores.append(score)
                     else:
@@ -832,11 +1223,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     effective_threshold,
                     args.confirmations,
                     frame_index,
-                    matching_centroid_index,
-                    matching_rotation_angle,
+                    identity_name=identity_name,
+                    matching_template_index=matching_template_index,
+                    matching_centroid_index=matching_centroid_index,
+                    matching_rotation_angle=matching_rotation_angle,
                 )
                 if previous is not FaceState.AUTHORIZED and current is FaceState.AUTHORIZED:
                     authorization_grants += 1
+                    if track.identity_name is not None:
+                        authorization_grants_by_owner[track.identity_name] += 1
                 elif previous is FaceState.AUTHORIZED and current is not FaceState.AUTHORIZED:
                     state_revocations += 1
 
@@ -876,6 +1271,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         for track in visible_tracks:
             if track.state is FaceState.AUTHORIZED:
                 authorized_observations += 1
+                if track.identity_name is not None:
+                    authorized_observations_by_owner[track.identity_name] += 1
             elif track.state is FaceState.PENDING:
                 pending_observations += 1
             else:
@@ -883,7 +1280,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             _draw_label(
                 output,
                 track,
-                template.name,
                 args.confirmations,
                 args.minimum_recognition_face_size,
             )
@@ -990,16 +1386,33 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elapsed = perf_counter() - started
     summary: dict[str, object] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": 19,
-        "identity": template.name,
-        "template_samples": len(template.embeddings),
-        "template_source_photos": template.metadata.get("source_photos"),
-        "template_rotation_centroids": len(template.rotation_centroids),
+        "pipeline_version": 21,
+        "identities": list(gallery.names),
+        "owners": [
+            {
+                "name": template.name,
+                "path": str(path),
+                "template_samples": len(template.embeddings),
+                "template_source_photos": template.metadata.get("source_photos"),
+                "template_rotation_centroids": len(template.rotation_centroids),
+                "threshold": owner_thresholds[template.name],
+            }
+            for template, path in zip(templates, gallery.paths, strict=True)
+        ],
         "settings": {
-            "threshold": threshold,
+            "auto_enroll": bool(not args.templates and args.auto_enroll),
+            "owners_photos_dir": (
+                str(args.owners_photos_dir.expanduser().resolve())
+                if not args.templates and args.auto_enroll
+                else None
+            ),
+            "enrollments_dir": str(args.enrollments_dir.expanduser().resolve()),
+            "threshold_override": args.threshold,
+            "owner_thresholds": owner_thresholds,
             "confirmations": args.confirmations,
             "authorized_recheck_interval": args.authorized_recheck_interval,
             "minimum_recognition_face_size": args.minimum_recognition_face_size,
+            "minimum_owner_face_size": args.minimum_recognition_face_size,
             "minimum_authorized_face_size": args.minimum_authorized_face_size,
             "unknown_retry_interval": args.unknown_retry_interval,
             "unknown_retry_policy": "exponential_backoff_x2_cap_300",
@@ -1028,7 +1441,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "realtime_video": args.realtime_video,
             "rotations": args.rotations,
             "rotation_angles": list(template_angles),
-            "template_matching_policy": "per_rotation_centroid_max",
+            "template_matching_policy": "all_owner_per_rotation_centroid_max",
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
             "face_preprocessing": face_preprocessing,
             "pipeline": f"main-thread-{source_kind.replace(' ', '-')}_single-worker-inference",
@@ -1092,11 +1505,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "crowded_frames": crowded_frames,
         "state_observations": {
             "authorized": authorized_observations,
+            "authorized_by_owner": authorized_observations_by_owner,
             "pending": pending_observations,
             "unknown": unknown_observations,
         },
         "state_transitions": {
             "authorization_grants": authorization_grants,
+            "authorization_grants_by_owner": authorization_grants_by_owner,
             "authorization_revocations": tracker.revocations + state_revocations,
         },
         "tracker": {
@@ -1108,6 +1523,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "positive_scores": _distribution(positive_scores),
         "negative_scores": _distribution(negative_scores),
+        "candidate_scores_by_owner": {
+            name: _distribution(scores)
+            for name, scores in candidate_scores_by_owner.items()
+        },
     }
     benchmark_path = Path(args.benchmark_out)
     benchmark_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1124,8 +1543,14 @@ def main() -> None:
     if args.max_frames < 0:
         raise SystemExit("--max-frames cannot be negative")
     try:
-        if args.offline_video and args.realtime_video:
-            raise ValueError("--offline-video and --realtime-video are mutually exclusive")
+        selected_modes = sum(
+            (args.offline_video, args.realtime_video, args.image_prompt_video)
+        )
+        if selected_modes > 1:
+            raise ValueError(
+                "--offline-video, --realtime-video, and --image-prompt-video "
+                "are mutually exclusive"
+            )
         if args.video_output_size is not None and args.video_output is None:
             raise ValueError("--video-output-size requires --video-output")
         if args.offline_video:
@@ -1153,6 +1578,79 @@ def main() -> None:
                 output_size=args.video_output_size,
             )
             return
+        if args.image_prompt_video:
+            if not args.reference_image:
+                raise ValueError(
+                    "At least one --reference-image is required with "
+                    "--image-prompt-video"
+                )
+            if args.video_path is not None and args.video_output is None:
+                raise ValueError(
+                    "--video-output is required when --image-prompt-video reads a file"
+                )
+            if args.video_prompt:
+                raise ValueError("--video-prompt is only used with --offline-video")
+            if args.sam2_checkpoint is not None:
+                raise ValueError(
+                    "--sam2-checkpoint belongs to --offline-video; use "
+                    "--image-edgetam-model for image-prompt mode"
+                )
+            if args.mirror is None:
+                args.mirror = args.video_path is None
+
+            from .image_prompt_video import process_image_prompt_stream
+
+            process_image_prompt_stream(
+                reference_images=args.reference_image,
+                video_path=args.video_path,
+                output_path=args.video_output,
+                output_size=args.video_output_size,
+                camera_index=args.camera,
+                camera_width=args.width,
+                camera_height=args.height,
+                camera_fps=args.camera_fps,
+                mirror=args.mirror,
+                preview=args.preview,
+                max_frames=args.max_frames,
+                benchmark_path=Path(args.benchmark_out) if args.benchmark_out else None,
+                yolo_model_id=args.image_yolo_model,
+                yolo_onnx=args.image_yolo_onnx,
+                edgetam_model_id=args.image_edgetam_model,
+                device=args.image_device,
+                precision=args.image_precision,
+                yolo_imgsz=args.image_yolo_imgsz,
+                yolo_reference_imgsz=args.image_yolo_reference_imgsz,
+                edgetam_imgsz=args.image_edgetam_imgsz,
+                reference_size=args.image_reference_size,
+                reference_sam=args.image_reference_sam,
+                reference_sam_model_id=args.image_reference_sam_model,
+                reference_sam_points=args.image_reference_sam_points,
+                reference_sam_min_area_ratio=(
+                    args.image_reference_sam_min_area_ratio
+                ),
+                reference_sam_max_area_ratio=(
+                    args.image_reference_sam_max_area_ratio
+                ),
+                yolo_confidence=args.image_yolo_confidence,
+                yolo_iou=args.image_yolo_iou,
+                edgetam_score_threshold=args.image_edgetam_score_threshold,
+                mask_threshold=args.image_mask_threshold,
+                min_mask_area=args.image_min_mask_area,
+                max_mask_area_ratio=args.image_max_mask_area_ratio,
+                max_objects=args.image_max_objects,
+                redetect_interval=args.image_redetect_interval,
+                mask_dilation=args.image_mask_dilation,
+                fallback_frames=args.image_fallback_frames,
+                pixel_block_size=args.image_pixel_block_size,
+                blur_kernel_size=args.image_blur_kernel_size,
+                redaction_mode=args.image_redaction,
+                fail_closed=args.image_fail_closed,
+                diagnostic_overlay=args.image_diagnostic_overlay,
+                tracker_mode=args.image_tracker,
+                iou_threshold=args.image_iou_threshold,
+                iou_max_missed=args.image_iou_max_missed,
+            )
+            return
         if args.realtime_video:
             if args.video_path is None:
                 raise ValueError("--video-path is required with --realtime-video")
@@ -1161,7 +1659,10 @@ def main() -> None:
             if args.video_prompt:
                 raise ValueError("--video-prompt is only used with --offline-video")
         elif args.video_path is not None:
-            raise ValueError("--video-path requires --offline-video or --realtime-video")
+            raise ValueError(
+                "--video-path requires --offline-video, --realtime-video, or "
+                "--image-prompt-video"
+            )
         elif args.video_prompt or args.sam2_checkpoint is not None:
             raise ValueError("Grounded SAM 2 options require --offline-video")
         if args.mirror is None:

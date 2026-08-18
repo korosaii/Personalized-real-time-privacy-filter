@@ -107,6 +107,91 @@ class EnrollmentTemplate:
         return self.best_rotation_match(embedding)[0]
 
 
+@dataclass(frozen=True)
+class TemplateMatch:
+    identity_name: str
+    template_index: int
+    score: float
+    threshold: float
+    centroid_index: int
+    rotation_angle: int
+
+
+@dataclass(frozen=True)
+class EnrollmentGallery:
+    templates: tuple[EnrollmentTemplate, ...]
+    paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        if not self.templates:
+            raise ValueError("Enrollment gallery must contain at least one owner")
+        if len(self.templates) != len(self.paths):
+            raise ValueError("Every enrollment template must have a source path")
+        normalized_names = [template.name.casefold() for template in self.templates]
+        duplicates = sorted(
+            {
+                template.name
+                for template in self.templates
+                if normalized_names.count(template.name.casefold()) > 1
+            }
+        )
+        if duplicates:
+            raise ValueError(
+                "Enrollment owner names must be unique; duplicates: "
+                + ", ".join(duplicates)
+            )
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(template.name for template in self.templates)
+
+    def best_match(
+        self,
+        embedding: np.ndarray,
+        threshold_override: float | None = None,
+    ) -> TemplateMatch:
+        candidates: list[TemplateMatch] = []
+        for template_index, template in enumerate(self.templates):
+            score, centroid_index, rotation_angle = template.best_rotation_match(
+                embedding
+            )
+            candidates.append(
+                TemplateMatch(
+                    identity_name=template.name,
+                    template_index=template_index,
+                    score=score,
+                    threshold=(
+                        template.threshold
+                        if threshold_override is None
+                        else float(threshold_override)
+                    ),
+                    centroid_index=centroid_index,
+                    rotation_angle=rotation_angle,
+                )
+            )
+        return max(candidates, key=lambda candidate: candidate.score)
+
+
+def load_gallery(paths: list[str | Path] | tuple[str | Path, ...]) -> EnrollmentGallery:
+    expanded: list[Path] = []
+    for value in paths:
+        source = Path(value).expanduser().resolve()
+        if source.is_dir():
+            templates = sorted(source.glob("*.npz"))
+            if not templates:
+                raise FileNotFoundError(
+                    f"Enrollment directory contains no .npz templates: {source}"
+                )
+            expanded.extend(templates)
+        else:
+            expanded.append(source)
+    unique_paths = tuple(dict.fromkeys(expanded))
+    return EnrollmentGallery(
+        templates=tuple(load_template(path) for path in unique_paths),
+        paths=unique_paths,
+    )
+
+
 def build_template(
     name: str,
     embeddings: list[np.ndarray] | np.ndarray,
