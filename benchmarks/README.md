@@ -33,6 +33,17 @@ Run all cameras in the extracted `P1E_S1` group:
 python benchmarks\chokepoint_privacy_benchmark.py --sequence P1E_S1
 ```
 
+Несколько групп можно передать повторением флага или через запятую:
+
+```powershell
+python benchmarks\chokepoint_privacy_benchmark.py `
+  --sequence P1E_S1 `
+  --sequence P1L_S1
+
+python benchmarks\chokepoint_privacy_benchmark.py `
+  --sequence P1E_S1,P1L_S1
+```
+
 Run a quick smoke test:
 
 ```powershell
@@ -41,6 +52,19 @@ python benchmarks\chokepoint_privacy_benchmark.py `
   --max-frames 350 `
   --output-prefix benchmarks\chokepoint_smoke
 ```
+
+Сравнить обработку без трекера и с одним из runtime-трекеров:
+
+```powershell
+python benchmarks\chokepoint_privacy_benchmark.py --tracker none
+python benchmarks\chokepoint_privacy_benchmark.py --tracker iou
+python benchmarks\chokepoint_privacy_benchmark.py --tracker bytetrack
+python benchmarks\chokepoint_privacy_benchmark.py --tracker botsort
+```
+
+По умолчанию используется `--tracker none`, поэтому прежний покадровый
+протокол и его результаты сохраняются. При включённом трекере его время входит
+в `tracker_ms` и общую latency `pipeline_ms`.
 
 The command writes a summary JSON and a frame-level CSV below `benchmarks`.
 When leaks exist, it also creates a JPG montage of the worst frames. Exit code
@@ -92,6 +116,29 @@ python benchmarks\chokepoint_multi_owner_benchmark.py `
   --minimum-owner-face-size 80
 ```
 
+Тот же тест с реальной привязкой подтверждений к track ID:
+
+```powershell
+python benchmarks\chokepoint_multi_owner_benchmark.py `
+  --sequence P1E_S1 `
+  --tracker bytetrack
+```
+
+Поддерживаются `none`, `iou`, `bytetrack` и `botsort`. По умолчанию выбран
+`none`, чтобы старые результаты оставались воспроизводимыми. При включённом
+трекере его время записывается отдельно в `tracker_ms` и входит в
+`face_active_pipeline_ms`.
+
+В multi-owner тесте также можно выбрать несколько групп обоими форматами
+`--sequence`. Для каждой группы templates C1/C2 строятся независимо, после
+чего результаты всех проходов объединяются в общую секцию `combined`:
+
+```powershell
+python benchmarks\chokepoint_multi_owner_benchmark.py `
+  --sequence P1E_S1,P1L_S1 `
+  --owners 0001,0003,0006
+```
+
 Свои ID, число enrollment-кадров и порог:
 
 ```powershell
@@ -120,13 +167,13 @@ python benchmarks\chokepoint_multi_owner_benchmark.py `
 - `owner_wrong_identity_rate` — владелец принят за другого владельца;
 - `stranger_confirmed_false_authorization_rate` — посторонний ошибочно открыт;
 - `stranger_privacy_recall` — посторонний обнаружен и остался скрытым;
-- `face_active_pipeline_ms` — detector + recognition + выбор владельца +
-  редактирование на кадрах с лицом.
+- `face_active_pipeline_ms` — detector + опциональный tracker + recognition +
+  выбор владельца + редактирование на кадрах с лицом.
 
 Тест проверяет классификацию и решение о редактировании на каждом GT-кадре.
-Ассоциация движения tracker и расписание повторных проверок `UNKNOWN` в этом
-cross-camera тесте не воспроизводятся; runtime с несколькими template отдельно
-проверяется обычным `privacy-recognize`.
+При `--tracker none` ассоциация движения не воспроизводится. В остальных
+режимах подтверждения привязываются к track ID, но runtime-расписание повторных
+проверок `UNKNOWN` всё ещё не воспроизводится.
 
 Фактические результаты текущего полного запуска и их интерпретация находятся
 в `benchmarks/chokepoint_multi_owner_report.md`.

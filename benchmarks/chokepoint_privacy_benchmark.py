@@ -21,6 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from privacy_filter.redaction import pixelate_faces  # noqa: E402
+from privacy_filter.tracking import create_face_tracker  # noqa: E402
 from privacy_filter.yolo import YOLOFaceDetector  # noqa: E402
 
 
@@ -59,8 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument(
         "--sequence",
-        default="P1E_S1",
-        help="ChokePoint group to test, for example P1E_S1 (all available cameras)",
+        dest="sequence_values",
+        action="append",
+        default=None,
+        metavar="GROUP[,GROUP...]",
+        help=(
+            "ChokePoint group(s) to test; repeat the option or separate groups "
+            "with commas (default: P1E_S1)"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -73,6 +80,16 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--detector-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--tracker",
+        choices=("none", "iou", "bytetrack", "botsort"),
+        default="none",
+        help="Tracking backend; none preserves independent per-frame evaluation",
+    )
+    parser.add_argument("--tracker-buffer", type=int, default=30)
+    parser.add_argument("--track-iou-threshold", type=float, default=0.25)
+    parser.add_argument("--authorization-iou-threshold", type=float, default=0.40)
+    parser.add_argument("--track-max-missed", type=int, default=8)
     parser.add_argument(
         "--minimum-eye-distance",
         type=float,
@@ -110,8 +127,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--failure-images", type=int, default=12)
     args = parser.parse_args()
+    try:
+        args.sequence_groups = parse_sequence_groups(args.sequence_values)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0.0 < args.detector_threshold < 1.0:
         parser.error("--detector-threshold must be between 0 and 1")
+    if args.tracker_buffer < 1:
+        parser.error("--tracker-buffer must be positive")
+    if not 0.0 < args.track_iou_threshold <= 1.0:
+        parser.error("--track-iou-threshold must be in (0, 1]")
+    if not args.track_iou_threshold <= args.authorization_iou_threshold <= 1.0:
+        parser.error(
+            "--authorization-iou-threshold must be between "
+            "--track-iou-threshold and 1"
+        )
+    if args.track_max_missed < 0:
+        parser.error("--track-max-missed cannot be negative")
     if args.minimum_eye_distance < 0.0:
         parser.error("--minimum-eye-distance cannot be negative")
     if not 0.0 <= args.minimum_zone_coverage <= 1.0:
@@ -129,6 +161,20 @@ def parse_args() -> argparse.Namespace:
     if args.failure_images < 0:
         parser.error("--failure-images cannot be negative")
     return args
+
+
+def parse_sequence_groups(values: list[str] | None) -> tuple[str, ...]:
+    groups = tuple(
+        dict.fromkeys(
+            group.strip()
+            for value in (values or ["P1E_S1"])
+            for group in value.split(",")
+            if group.strip()
+        )
+    )
+    if not groups:
+        raise ValueError("At least one non-empty --sequence group is required")
+    return groups
 
 
 def _groundtruth_root(data_root: Path) -> Path:
@@ -406,7 +452,11 @@ def _longest_leak_streak(rows: Iterable[dict[str, object]]) -> int:
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    sequences = discover_sequences(args.data_root, args.sequence)
+    sequences = tuple(
+        sequence
+        for group in args.sequence_groups
+        for sequence in discover_sequences(args.data_root, group)
+    )
     model_path = args.model.expanduser().resolve()
     detector = YOLOFaceDetector(
         model_path,
@@ -419,6 +469,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     rows: list[dict[str, object]] = []
     detector_latencies: list[float] = []
+    tracker_latencies: list[float] = []
     redaction_latencies: list[float] = []
     pipeline_latencies: list[float] = []
     read_latencies: list[float] = []
@@ -427,6 +478,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     processed = 0
 
     for sequence in sequences:
+        tracker = (
+            None
+            if args.tracker == "none"
+            else create_face_tracker(
+                backend_name=args.tracker,
+                iou_threshold=args.track_iou_threshold,
+                max_missed_frames=args.track_max_missed,
+                authorization_iou_threshold=args.authorization_iou_threshold,
+                track_buffer=args.tracker_buffer,
+            )
+        )
         for ordinal, (frame_number_text, face) in enumerate(sequence.frames):
             if ordinal % args.frame_step:
                 continue
@@ -441,18 +503,38 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 continue
 
             detected = detector.detect(frame)
+            if tracker is None:
+                redaction_detections = detected.detections
+                tracker_ms = 0.0
+            else:
+                tracker_started = perf_counter()
+                visible_tracks = tracker.update(
+                    detected.detections,
+                    int(frame_number_text),
+                    frame,
+                )
+                redaction_detections = np.asarray(
+                    [track.detection for track in visible_tracks],
+                    dtype=np.float32,
+                )
+                if not len(redaction_detections):
+                    redaction_detections = np.empty((0, 5), dtype=np.float32)
+                tracker_ms = (perf_counter() - tracker_started) * 1000.0
             redaction_started = perf_counter()
-            pixelate_faces(frame, detected.detections)
+            pixelate_faces(frame, redaction_detections)
             redaction_ms = (perf_counter() - redaction_started) * 1000.0
-            pipeline_ms = detected.latency_ms + redaction_ms
+            pipeline_ms = detected.latency_ms + tracker_ms + redaction_ms
             read_latencies.append(read_ms)
             detector_latencies.append(detected.latency_ms)
+            tracker_latencies.append(tracker_ms)
             redaction_latencies.append(redaction_ms)
             pipeline_latencies.append(pipeline_ms)
 
             eye_distance = face.eye_distance if face is not None else None
             graded_face = face is not None and eye_distance >= args.minimum_eye_distance
-            evaluation = evaluate_face(face, detected.detections) if face is not None else None
+            evaluation = (
+                evaluate_face(face, redaction_detections) if face is not None else None
+            )
             privacy_leak = bool(
                 graded_face
                 and evaluation is not None
@@ -472,7 +554,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "has_groundtruth_face": face is not None,
                 "eye_distance_px": round(eye_distance, 4) if eye_distance is not None else "",
                 "graded_face": graded_face,
-                "detections": len(detected.detections),
+                "detector_detections": len(detected.detections),
+                "detections": len(redaction_detections),
                 "both_eyes_covered": (
                     evaluation.both_eyes_covered if evaluation is not None else ""
                 ),
@@ -480,15 +563,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     round(evaluation.zone_coverage, 6) if evaluation is not None else ""
                 ),
                 "privacy_leak": privacy_leak,
-                "false_positive_proxy": face is None and len(detected.detections) > 0,
+                "false_positive_proxy": face is None and len(redaction_detections) > 0,
                 "redacted_area_fraction": round(
                     _redacted_area_fraction(
-                        detected.detections, frame.shape[1], frame.shape[0]
+                        redaction_detections, frame.shape[1], frame.shape[0]
                     ),
                     6,
                 ),
                 "read_ms": round(read_ms, 4),
                 "detector_ms": round(detected.latency_ms, 4),
+                "tracker_ms": round(tracker_ms, 4),
                 "redaction_ms": round(redaction_ms, 4),
                 "pipeline_ms": round(pipeline_ms, 4),
             }
@@ -501,7 +585,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         "sequence": sequence.name,
                         "frame_number": frame_number_text,
                         "path": frame_path,
-                        "detections": detected.detections.tolist(),
+                        "detections": redaction_detections.tolist(),
                         "face": face,
                     }
                 )
@@ -558,12 +642,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "checks": checks,
         "configuration": {
             "data_root": str(args.data_root.expanduser().resolve()),
-            "sequence_group": args.sequence,
+            "sequence_group": (
+                args.sequence_groups[0] if len(args.sequence_groups) == 1 else None
+            ),
+            "sequence_groups": list(args.sequence_groups),
             "sequences": [sequence.name for sequence in sequences],
             "model": str(model_path),
             "provider_requested": args.provider,
             "providers_active": detector.providers,
             "detector_threshold": args.detector_threshold,
+            "tracker": args.tracker,
+            "tracker_buffer": args.tracker_buffer,
+            "track_iou_threshold": args.track_iou_threshold,
+            "authorization_iou_threshold": args.authorization_iou_threshold,
+            "track_max_missed": args.track_max_missed,
             "redaction": "project pixelate_faces ellipse",
             "minimum_eye_distance_px": args.minimum_eye_distance,
             "minimum_zone_coverage": args.minimum_zone_coverage,
@@ -608,6 +700,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             ),
             "image_read_ms": _distribution(read_latencies),
             "detector_ms": _distribution(detector_latencies),
+            "tracker_ms": _distribution(tracker_latencies),
             "redaction_ms": _distribution(redaction_latencies),
             "pipeline_ms": _distribution(pipeline_latencies),
         },
@@ -621,7 +714,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "Face-zone coverage uses a documented eye-derived ellipse; eye recall is exact.",
             "Approximate face-zone coverage is diagnostic unless minimum_zone_coverage is greater than zero.",
             "False positives are a proxy because unannotated profile faces may still be visible.",
-            "Performance measures detector plus the project's face redaction, excluding disk read and report metrics.",
+            "Performance measures detector, optional tracker, and the project's face redaction, excluding disk read and report metrics.",
         ],
     }
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

@@ -21,6 +21,7 @@ from benchmarks.chokepoint_privacy_benchmark import (  # noqa: E402
     GroundTruthFace,
     SequenceInput,
     discover_sequences,
+    parse_sequence_groups,
 )
 from privacy_filter.enrollment import (  # noqa: E402
     EnrollmentGallery,
@@ -34,6 +35,7 @@ from privacy_filter.recognition import (  # noqa: E402
     FaceEmbedder,
 )
 from privacy_filter.redaction import pixelate_faces  # noqa: E402
+from privacy_filter.tracking import FaceTrack, create_face_tracker  # noqa: E402
 from privacy_filter.yolo import YOLOFaceDetector  # noqa: E402
 
 
@@ -51,7 +53,17 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--sequence", default="P1E_S1")
+    parser.add_argument(
+        "--sequence",
+        dest="sequence_values",
+        action="append",
+        default=None,
+        metavar="GROUP[,GROUP...]",
+        help=(
+            "ChokePoint group(s) to test; repeat the option or separate groups "
+            "with commas (default: P1E_S1)"
+        ),
+    )
     parser.add_argument(
         "--owners",
         default="0001,0003,0006",
@@ -75,6 +87,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recognition-model", default="r50-webface600k")
     parser.add_argument("--provider", default="auto")
     parser.add_argument("--detector-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--tracker",
+        choices=("none", "iou", "bytetrack", "botsort"),
+        default="none",
+        help="Tracking backend; none preserves the original confirmation simulation",
+    )
+    parser.add_argument("--tracker-buffer", type=int, default=30)
+    parser.add_argument("--track-iou-threshold", type=float, default=0.25)
+    parser.add_argument("--authorization-iou-threshold", type=float, default=0.40)
+    parser.add_argument("--track-max-missed", type=int, default=8)
     parser.add_argument("--target-fps", type=float, default=30.0)
     parser.add_argument(
         "--output-prefix",
@@ -87,6 +109,10 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/enrollments/chokepoint_multi_owner"),
     )
     args = parser.parse_args()
+    try:
+        args.sequence_groups = parse_sequence_groups(args.sequence_values)
+    except ValueError as error:
+        parser.error(str(error))
     args.owner_ids = tuple(
         dict.fromkeys(value.strip() for value in args.owners.split(",") if value.strip())
     )
@@ -102,6 +128,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--minimum-recognition-face-size must be positive")
     if not 0.0 < args.detector_threshold < 1.0:
         parser.error("--detector-threshold must be between 0 and 1")
+    if args.tracker_buffer < 1:
+        parser.error("--tracker-buffer must be positive")
+    if not 0.0 < args.track_iou_threshold <= 1.0:
+        parser.error("--track-iou-threshold must be in (0, 1]")
+    if not args.track_iou_threshold <= args.authorization_iou_threshold <= 1.0:
+        parser.error(
+            "--authorization-iou-threshold must be between "
+            "--track-iou-threshold and 1"
+        )
+    if args.track_max_missed < 0:
+        parser.error("--track-max-missed cannot be negative")
     if args.target_fps <= 0.0:
         parser.error("--target-fps must be positive")
     return args
@@ -158,6 +195,18 @@ def _face_detection(
     if not candidates:
         return None
     return max(candidates, key=lambda detection: float(detection[4]))
+
+
+def _face_track(face: GroundTruthFace, tracks: list[FaceTrack]) -> FaceTrack | None:
+    candidates = [
+        track
+        for track in tracks
+        if _inside_detection(face.left_eye, track.detection)
+        and _inside_detection(face.right_eye, track.detection)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda track: float(track.detection[4]))
 
 
 def _diverse_candidates(
@@ -252,9 +301,15 @@ def evaluate_pass(
     confirmations: int,
     minimum_face_size: float,
     target_fps: float,
+    tracker_backend: str,
+    tracker_buffer: int,
+    track_iou_threshold: float,
+    authorization_iou_threshold: float,
+    track_max_missed: int,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     rows: list[dict[str, object]] = []
     detector_latencies: list[float] = []
+    tracker_latencies: list[float] = []
     recognition_latencies: list[float] = []
     redaction_latencies: list[float] = []
     pipeline_latencies: list[float] = []
@@ -264,9 +319,22 @@ def evaluate_pass(
     previous_person: str | None = None
     previous_frame: int | None = None
     processed_faces = 0
+    tracker = (
+        None
+        if tracker_backend == "none"
+        else create_face_tracker(
+            backend_name=tracker_backend,
+            iou_threshold=track_iou_threshold,
+            max_missed_frames=track_max_missed,
+            authorization_iou_threshold=authorization_iou_threshold,
+            track_buffer=tracker_buffer,
+        )
+    )
 
     for frame_number_text, face in sequence.frames:
         if face is None:
+            if tracker is not None:
+                tracker.tracks.clear()
             previous_person = None
             previous_frame = None
             streak_identity = None
@@ -279,6 +347,8 @@ def evaluate_pass(
             or previous_frame is None
             or frame_number != previous_frame + 1
         ):
+            if tracker is not None:
+                tracker.tracks.clear()
             streak_identity = None
             streak = 0
             confirmed_identity = None
@@ -290,7 +360,17 @@ def evaluate_pass(
         if frame is None:
             raise FileNotFoundError(f"Could not decode evaluation frame: {frame_path}")
         detected = detector.detect(frame)
-        detection = _face_detection(face, detected.detections)
+        if tracker is None:
+            visible_tracks: list[FaceTrack] = []
+            selected_track = None
+            detection = _face_detection(face, detected.detections)
+            tracker_ms = 0.0
+        else:
+            tracker_started = perf_counter()
+            visible_tracks = tracker.update(detected.detections, frame_number, frame)
+            selected_track = _face_track(face, visible_tracks)
+            detection = selected_track.detection if selected_track is not None else None
+            tracker_ms = (perf_counter() - tracker_started) * 1000.0
         face_size = (
             min(float(detection[2] - detection[0]), float(detection[3] - detection[1]))
             if detection is not None
@@ -311,23 +391,62 @@ def evaluate_pass(
             if score >= match.threshold:
                 raw_identity = match.identity_name.removeprefix("person_")
 
-        if raw_identity is None:
-            streak_identity = None
-            streak = 0
-        elif raw_identity == streak_identity:
-            streak += 1
+        if tracker is None:
+            if raw_identity is None:
+                streak_identity = None
+                streak = 0
+            elif raw_identity == streak_identity:
+                streak += 1
+            else:
+                streak_identity = raw_identity
+                streak = 1
+            if confirmed_identity is None and streak >= confirmations:
+                confirmed_identity = streak_identity
+        elif selected_track is not None:
+            if recognition_attempted:
+                selected_track.record_recognition(
+                    score,
+                    threshold,
+                    confirmations,
+                    frame_number,
+                    identity_name=raw_identity,
+                )
+            confirmed_identity = (
+                selected_track.identity_name if selected_track.authorized else None
+            )
         else:
-            streak_identity = raw_identity
-            streak = 1
-        if confirmed_identity is None and streak >= confirmations:
-            confirmed_identity = streak_identity
+            confirmed_identity = None
 
         redaction_started = perf_counter()
-        if confirmed_identity is None:
-            pixelate_faces(frame, detected.detections)
+        if tracker is None:
+            if confirmed_identity is None:
+                pixelate_faces(frame, detected.detections)
+        else:
+            authorized_detection_indexes = {
+                track.detection_index
+                for track in visible_tracks
+                if track.authorized and track.detection_index is not None
+            }
+            unauthorized = np.asarray(
+                [
+                    detection_row
+                    for detection_index, detection_row in enumerate(detected.detections)
+                    if detection_index not in authorized_detection_indexes
+                ],
+                dtype=np.float32,
+            )
+            if len(unauthorized):
+                pixelate_faces(frame, unauthorized)
         redaction_ms = (perf_counter() - redaction_started) * 1000.0
-        pipeline_ms = detected.latency_ms + recognition_ms + matching_ms + redaction_ms
+        pipeline_ms = (
+            detected.latency_ms
+            + tracker_ms
+            + recognition_ms
+            + matching_ms
+            + redaction_ms
+        )
         detector_latencies.append(detected.latency_ms)
+        tracker_latencies.append(tracker_ms)
         if recognition_attempted:
             recognition_latencies.append(recognition_ms)
         redaction_latencies.append(redaction_ms)
@@ -375,6 +494,7 @@ def evaluate_pass(
                 "frame_number": frame_number,
                 "person_id": face.person_id,
                 "is_owner": is_owner,
+                "track_id": selected_track.track_id if selected_track is not None else "",
                 "eye_distance_px": round(face.eye_distance, 4),
                 "detector_covers_eyes": detector_covers_eyes,
                 "face_size_px": round(face_size, 4),
@@ -389,6 +509,7 @@ def evaluate_pass(
                 "stranger_privacy_safe": stranger_privacy_safe,
                 "outcome": outcome,
                 "detector_ms": round(detected.latency_ms, 4),
+                "tracker_ms": round(tracker_ms, 4),
                 "recognition_ms": round(recognition_ms, 4),
                 "matching_ms": round(matching_ms, 4),
                 "redaction_ms": round(redaction_ms, 4),
@@ -488,6 +609,7 @@ def evaluate_pass(
         "performance": {
             "frame_budget_ms": budget_ms,
             "detector_ms": _distribution(detector_latencies),
+            "tracker_ms": _distribution(tracker_latencies),
             "recognition_call_ms": _distribution(recognition_latencies),
             "redaction_ms": _distribution(redaction_latencies),
             "face_active_pipeline_ms": _distribution(pipeline_latencies),
@@ -499,20 +621,26 @@ def evaluate_pass(
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    sequences = discover_sequences(args.data_root, args.sequence)
-    definitions = (
+    grouped_sequences = tuple(
+        (group, discover_sequences(args.data_root, group))
+        for group in args.sequence_groups
+    )
+    base_definitions = (
         PassDefinition("pass_1", "C1", "C2"),
         PassDefinition("pass_2", "C2", "C1"),
     )
-    available_ids = {
-        face.person_id
-        for sequence in sequences
-        for _, face in sequence.frames
-        if face is not None
-    }
-    missing_owners = sorted(set(args.owner_ids).difference(available_ids))
-    if missing_owners:
-        raise ValueError("Owner IDs absent from the selected group: " + ", ".join(missing_owners))
+    for group, sequences in grouped_sequences:
+        available_ids = {
+            face.person_id
+            for sequence in sequences
+            for _, face in sequence.frames
+            if face is not None
+        }
+        missing_owners = sorted(set(args.owner_ids).difference(available_ids))
+        if missing_owners:
+            raise ValueError(
+                f"Owner IDs absent from group {group}: " + ", ".join(missing_owners)
+            )
 
     models = prepare_runtime_models(
         args.detector,
@@ -533,51 +661,67 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     pass_metrics = []
     all_rows: list[dict[str, object]] = []
     enrollment_details = {}
-    for definition in definitions:
-        print(
-            f"{definition.name}: enroll {definition.enrollment_camera}, "
-            f"evaluate {definition.evaluation_camera}",
-            flush=True,
-        )
-        enrollment_sequence = _camera_sequence(
-            sequences, f"_{definition.enrollment_camera}"
-        )
-        evaluation_sequence = _camera_sequence(
-            sequences, f"_{definition.evaluation_camera}"
-        )
-        gallery, enrollment_frames = build_gallery(
-            definition,
-            enrollment_sequence,
-            args.owner_ids,
-            detector,
-            embedder,
-            models.recognition_source_sha256,
-            args.threshold,
-            args.enrollment_samples,
-            args.enrollment_output,
-        )
-        print(
-            f"{definition.name}: enrolled {', '.join(gallery.names)}",
-            flush=True,
-        )
-        metrics, rows = evaluate_pass(
-            definition,
-            evaluation_sequence,
-            gallery,
-            args.owner_ids,
-            detector,
-            embedder,
-            args.threshold,
-            args.confirmations,
-            args.minimum_recognition_face_size,
-            args.target_fps,
-        )
-        pass_metrics.append(metrics)
-        all_rows.extend(rows)
-        enrollment_details[definition.name] = {
-            "templates": [str(path) for path in gallery.paths],
-            "frames_by_owner": enrollment_frames,
-        }
+    multiple_groups = len(grouped_sequences) > 1
+    for group, sequences in grouped_sequences:
+        for base_definition in base_definitions:
+            definition = (
+                PassDefinition(
+                    f"{group}_{base_definition.name}",
+                    base_definition.enrollment_camera,
+                    base_definition.evaluation_camera,
+                )
+                if multiple_groups
+                else base_definition
+            )
+            print(
+                f"{definition.name}: enroll {definition.enrollment_camera}, "
+                f"evaluate {definition.evaluation_camera}",
+                flush=True,
+            )
+            enrollment_sequence = _camera_sequence(
+                sequences, f"_{definition.enrollment_camera}"
+            )
+            evaluation_sequence = _camera_sequence(
+                sequences, f"_{definition.evaluation_camera}"
+            )
+            gallery, enrollment_frames = build_gallery(
+                definition,
+                enrollment_sequence,
+                args.owner_ids,
+                detector,
+                embedder,
+                models.recognition_source_sha256,
+                args.threshold,
+                args.enrollment_samples,
+                args.enrollment_output,
+            )
+            print(
+                f"{definition.name}: enrolled {', '.join(gallery.names)}",
+                flush=True,
+            )
+            metrics, rows = evaluate_pass(
+                definition,
+                evaluation_sequence,
+                gallery,
+                args.owner_ids,
+                detector,
+                embedder,
+                args.threshold,
+                args.confirmations,
+                args.minimum_recognition_face_size,
+                args.target_fps,
+                args.tracker,
+                args.tracker_buffer,
+                args.track_iou_threshold,
+                args.authorization_iou_threshold,
+                args.track_max_missed,
+            )
+            pass_metrics.append(metrics)
+            all_rows.extend(rows)
+            enrollment_details[definition.name] = {
+                "templates": [str(path) for path in gallery.paths],
+                "frames_by_owner": enrollment_frames,
+            }
 
     owner_frames = sum(int(item["owner_frames"]) for item in pass_metrics)
     owner_attempted_frames = sum(
@@ -659,7 +803,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "checks": checks,
         "configuration": {
             "data_root": str(args.data_root.expanduser().resolve()),
-            "sequence": args.sequence,
+            "sequence": (
+                args.sequence_groups[0] if len(args.sequence_groups) == 1 else None
+            ),
+            "sequence_groups": list(args.sequence_groups),
             "owner_ids": list(args.owner_ids),
             "enrollment_samples_per_owner": args.enrollment_samples,
             "threshold": args.threshold,
@@ -668,13 +815,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "minimum_owner_face_size": args.minimum_recognition_face_size,
             "detector": args.detector,
             "recognition_model": args.recognition_model,
+            "tracker": args.tracker,
+            "tracker_buffer": args.tracker_buffer,
+            "track_iou_threshold": args.track_iou_threshold,
+            "authorization_iou_threshold": args.authorization_iou_threshold,
+            "track_max_missed": args.track_max_missed,
             "detector_providers": detector.providers,
             "recognition_providers": embedder.providers,
             "target_fps": args.target_fps,
         },
         "protocol": {
-            "pass_1": "enroll C1, evaluate C2",
-            "pass_2": "enroll C2, evaluate C1",
+            "pass_1": "enroll C1, evaluate C2 within each selected group",
+            "pass_2": "enroll C2, evaluate C1 within each selected group",
+            "group_isolation": "Enrollment templates are rebuilt independently per group.",
             "gt_usage": [
                 "XML frame number selects the matching source JPG without changing it.",
                 "person id defines owner versus stranger and the expected owner identity.",
@@ -686,8 +839,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "reset on a person or frame gap."
             ),
             "scope": (
-                "Classifier and redaction decision on every GT face frame; tracker motion "
-                "association and UNKNOWN retry scheduling are not replayed."
+                "Classifier and redaction decision on every GT face frame; "
+                + (
+                    "tracker association is replayed, but UNKNOWN retry scheduling is not."
+                    if args.tracker != "none"
+                    else "tracker association and UNKNOWN retry scheduling are not replayed."
+                )
             ),
         },
         "enrollment": enrollment_details,
