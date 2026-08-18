@@ -489,11 +489,14 @@ MP4 пока создаётся без аудиодорожки. Если SAM 2.
 
 Отдельный `--image-prompt-video` режим ищет не текстовый класс, а объекты,
 похожие на загруженные изображения. По умолчанию SAM 2 Tiny один раз при старте
-автоматически выделяет центральный foreground каждого reference. YOLOE получает
-два prompt-варианта с общим class ID: natural tight crop с небольшим контекстом
-и masked crop на нейтральном фоне. В realtime цикле reference SAM не работает и
+автоматически выделяет центральный foreground каждого reference. Точная бинарная
+SAM-маска передаётся в visual prompt encoder YOLOE. Каждая фотография кодируется
+отдельно в собственный prototype class, поэтому добавление ракурсов не уменьшает
+их разрешение из-за упаковки в общую gallery. В realtime цикле reference SAM не
+работает и
 на FPS не влияет. Один каталог считается одним объектом, а файлы внутри него —
-его ракурсами. Повторные `--reference-image` создают отдельные object classes.
+его независимыми ракурсами. Повторные `--reference-image` создают отдельные object
+classes.
 
 Обработка файла:
 
@@ -506,7 +509,8 @@ privacy-recognize --image-prompt-video `
 ```
 
 Если нужно скрывать два разных объекта, повторите флаг с двумя путями. Чтобы
-объединить несколько ракурсов одного объекта в один class ID, положите их в
+объединить несколько prototype-ракурсов в один выходной object class, положите
+их в
 один каталог и передайте этот каталог одним `--reference-image`.
 
 Обработка веб-камеры:
@@ -521,9 +525,9 @@ privacy-recognize --image-prompt-video `
 
 ```mermaid
 flowchart TD
-    A["Несколько reference images"] --> S["SAM 2 Tiny: foreground один раз"]
-    S --> B["Gallery + tight bounding box каждого reference"]
-    B --> C["YOLOE visual prompt embeddings — один раз при старте"]
+    A["Несколько reference images"] --> S["SAM 2 Tiny: exact foreground mask один раз"]
+    S --> B["Каждая фотография → отдельный exact-mask prototype"]
+    B --> C["YOLOE visual embeddings каждого ракурса — один раз при старте"]
     D["Кадр камеры или видео"] --> E{"Режим tracker"}
     C --> F["YOLOE: похожие объекты и confidence"]
     E -- "IoU: каждый кадр" --> F
@@ -537,18 +541,19 @@ flowchart TD
     L --> M["Preview и/или MP4"]
 ```
 
-YOLOE извлекает visual embeddings из общей gallery один раз при запуске. В
-режиме `iou` YOLOE-seg запускается на каждом кадре, а bbox связываются с
-предыдущими по IoU; EdgeTAM не загружается. В режиме `edgetam` YOLOE ищет
-объекты только на keyframes, а EdgeTAM переносит маски между ними.
-Natural и masked варианты одного ракурса, а также все изображения внутри одного
-reference-каталога используют одинаковый class ID. Class-agnostic NMS и
+YOLOE извлекает отдельный visual embedding из каждой фотографии один раз при
+запуске. Ракурсы одного reference-каталога остаются отдельными prototype classes,
+а после class-agnostic NMS отображаются обратно в общий object class. В режиме
+`iou` YOLOE-seg запускается на каждом кадре, а bbox связываются с предыдущими по
+IoU; EdgeTAM не загружается. В режиме `edgetam` YOLOE ищет объекты только на
+keyframes, а EdgeTAM переносит маски между ними. Class-agnostic NMS и
 дополнительная проверка overlap-over-smaller-box оставляют из вложенных или
 пересекающихся дубликатов только bbox с наибольшей confidence.
 
 Флаг `--image-yolo-onnx` после извлечения visual embeddings экспортирует модель
 в FP32 ONNX с фиксированными prompts. Результат кэшируется в
-`models/yoloe/onnx/` по содержимому checkpoint и reference gallery. Повторный
+`models/yoloe/onnx/` по содержимому checkpoint, reference-фотографий и масок.
+Повторный
 запуск использует готовый ONNX; изменение референсов создаёт новый файл. Такой
 ONNX не принимает новые visual prompts во время inference — для нового объекта
 нужен новый export/cache entry.
@@ -581,7 +586,7 @@ CUDA/MPS.
 | `--reference-image PATH` | обязательный | Папка объединяет ракурсы одного объекта; повторные пути создают отдельные классы. |
 | `--image-yolo-model` | `models/yoloe/yoloe-26n-seg.pt` | Веса YOLOE visual-prompt segmentation. |
 | `--image-yolo-onnx` / `--no-image-yolo-onnx` | выключен | Создать/использовать reference-specific FP32 ONNX с фиксированными visual prompts. |
-| `--image-reference-sam` / `--no-image-reference-sam` | включён | Одноразово удалить фон reference через SAM 2 или использовать изображения как есть. |
+| `--image-reference-sam` / `--no-image-reference-sam` | включён | Одноразово извлечь exact foreground mask через SAM 2 или использовать всю фотографию как prompt. |
 | `--image-reference-sam-model` | `facebook/sam2.1-hiera-tiny` | Лёгкая SAM 2 модель только для preprocessing референсов. |
 | `--image-reference-sam-points` | `8` | Сторона сетки automatic mask generation; число prompts растёт как квадрат значения. |
 | `--image-reference-sam-min-area-ratio` | `0.01` | Минимальная доля reference, занимаемая выбранной маской. |
@@ -602,9 +607,9 @@ CUDA/MPS.
 | `--image-redetect-interval` | `5` | Частота YOLOE только в режиме EdgeTAM; в IoU-режиме YOLOE работает каждый кадр. |
 | `--image-max-objects` | `20` | Максимум одновременно передаваемых EdgeTAM объектов. |
 | `--image-yolo-imgsz` | `640` | Разрешение YOLOE; меньше ускоряет поиск, но ухудшает мелкие объекты. |
-| `--image-yolo-reference-imgsz` | `640` | Вход YOLOE при однократном извлечении visual embeddings из gallery. |
+| `--image-yolo-reference-imgsz` | `640` | Вход YOLOE при отдельном однократном извлечении visual embedding каждой фотографии. |
 | `--image-edgetam-imgsz` | `1024` | Квадратный вход EdgeTAM; `256–1024`, кратно `64`. |
-| `--image-reference-size` | `1280` | Размер исходного canvas gallery до YOLOE preprocessing. |
+| `--image-reference-size` | `1280` | Максимальная сторона каждой reference-фотографии до YOLOE preprocessing; меньшие изображения здесь не увеличиваются. |
 | `--image-mask-dilation` | `5` | Запас маски вокруг границы объекта в пикселях. |
 | `--image-fallback-frames` | `3` | Сколько кадров держать последнюю маску при кратком пропадании трека. |
 | `--image-redaction` | `blur` | Эффект скрытия: настоящий Gaussian `blur` или `pixelate`. |
@@ -646,7 +651,7 @@ keyframes значение `yolo` сохраняется от последней
 согласованно перестраивает processor, FPN feature grids, prompt encoder и RoPE
 memory attention; одного resize изображения для этой модели недостаточно.
 
-| Оборудование / сценарий | YOLOE кадр | YOLOE references | EdgeTAM | Gallery |
+| Оборудование / сценарий | YOLOE кадр | YOLOE references | EdgeTAM | Максимальная сторона reference |
 |---|---:|---:|---:|---:|
 | CPU, IoU максимум скорости | `416` | `512` | выключен | `1024` |
 | CPU, IoU баланс | `512` | `640` | выключен | `1280` |

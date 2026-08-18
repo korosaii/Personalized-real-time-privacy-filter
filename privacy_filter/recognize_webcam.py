@@ -277,7 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-yolo-reference-imgsz",
         type=int,
         default=640,
-        help="Square YOLOE input used once to encode the reference gallery",
+        help="Square YOLOE input used once for each reference prototype",
     )
     image_prompt.add_argument(
         "--image-edgetam-imgsz",
@@ -288,14 +288,19 @@ def build_parser() -> argparse.ArgumentParser:
             "lower values are faster but reduce mask quality"
         ),
     )
-    image_prompt.add_argument("--image-reference-size", type=int, default=1280)
+    image_prompt.add_argument(
+        "--image-reference-size",
+        type=int,
+        default=1280,
+        help="Maximum side of each independently encoded reference image",
+    )
     image_prompt.add_argument(
         "--image-reference-sam",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Run SAM 2 once at startup to remove reference backgrounds; disable "
-            "with --no-image-reference-sam for already isolated crops"
+            "Run SAM 2 once at startup to create exact foreground prompts; disable "
+            "with --no-image-reference-sam to use each full image as its prompt"
         ),
     )
     image_prompt.add_argument(

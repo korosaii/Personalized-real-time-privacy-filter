@@ -7,6 +7,9 @@ __pycache__/
 .cache/
 README_LOCAL.md
 tests/
+!tests/
+tests/*
+!tests/test_image_prompt_video.py
 
 models/**/*.onnx
 models/**/*.pth

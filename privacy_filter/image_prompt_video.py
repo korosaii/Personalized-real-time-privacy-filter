@@ -83,12 +83,12 @@ class ReferenceSegmentation:
 
 
 @dataclass(frozen=True)
-class ReferencePromptVariant:
+class ReferencePrototype:
     image: np.ndarray
-    box: tuple[float, float, float, float]
-    class_index: int
+    mask: np.ndarray
+    object_index: int
     path: Path
-    kind: str
+    uses_sam_mask: bool
 
 
 def resolve_yolo_model_source(value: str | Path) -> str:
@@ -181,128 +181,73 @@ def resolve_reference_paths(values: Iterable[str | Path]) -> list[Path]:
     return [path for group in resolve_reference_groups(values) for path in group]
 
 
-def _build_reference_variants(
+def build_reference_prototypes(
     reference_groups: Iterable[tuple[Path, ...]],
     reference_masks: dict[Path, np.ndarray] | None,
     *,
+    maximum_size: int,
     crop_padding_ratio: float = 0.05,
-) -> list[ReferencePromptVariant]:
-    variants: list[ReferencePromptVariant] = []
-    for class_index, group in enumerate(reference_groups):
+) -> list[ReferencePrototype]:
+    """Create one independently encoded, exact-mask prototype per reference."""
+    if maximum_size <= 0:
+        raise ValueError("reference maximum size must be positive")
+    prototypes: list[ReferencePrototype] = []
+    for object_index, group in enumerate(reference_groups):
         for path in group:
             image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if image is None or image.size == 0:
                 raise ValueError(f"Could not decode reference image: {path}")
             mask = reference_masks.get(path) if reference_masks is not None else None
             if mask is None:
-                variants.append(
-                    ReferencePromptVariant(
-                        image=image,
-                        box=(0.0, 0.0, float(image.shape[1]), float(image.shape[0])),
-                        class_index=class_index,
-                        path=path,
-                        kind="natural",
+                mask = np.ones(image.shape[:2], dtype=bool)
+                uses_sam_mask = False
+            else:
+                mask = np.asarray(mask, dtype=bool)
+                if mask.shape != image.shape[:2]:
+                    raise ValueError(
+                        f"Reference mask shape {mask.shape} does not match "
+                        f"{path.name} shape {image.shape[:2]}"
                     )
-                )
-                continue
+                if not np.any(mask):
+                    raise ValueError(f"Reference mask is empty: {path}")
+                uses_sam_mask = True
 
-            mask = np.asarray(mask, dtype=bool)
-            if mask.shape != image.shape[:2]:
-                raise ValueError(
-                    f"Reference mask shape {mask.shape} does not match "
-                    f"{path.name} shape {image.shape[:2]}"
+                x, y, width, height = cv2.boundingRect(mask.astype(np.uint8))
+                pad_x = max(2, round(width * crop_padding_ratio))
+                pad_y = max(2, round(height * crop_padding_ratio))
+                crop_x1 = max(0, x - pad_x)
+                crop_y1 = max(0, y - pad_y)
+                crop_x2 = min(image.shape[1], x + width + pad_x)
+                crop_y2 = min(image.shape[0], y + height + pad_y)
+                image = image[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+                mask = mask[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+            height, width = image.shape[:2]
+            scale = min(1.0, maximum_size / max(height, width))
+            if scale < 1.0:
+                resized_size = (
+                    max(1, round(width * scale)),
+                    max(1, round(height * scale)),
                 )
-            if not np.any(mask):
-                raise ValueError(f"Reference mask is empty: {path}")
-            x, y, width, height = cv2.boundingRect(mask.astype(np.uint8))
-            pad_x = max(2, round(width * crop_padding_ratio))
-            pad_y = max(2, round(height * crop_padding_ratio))
-            crop_x1 = max(0, x - pad_x)
-            crop_y1 = max(0, y - pad_y)
-            crop_x2 = min(image.shape[1], x + width + pad_x)
-            crop_y2 = min(image.shape[0], y + height + pad_y)
-            natural = image[crop_y1:crop_y2, crop_x1:crop_x2].copy()
-            mask_crop = mask[crop_y1:crop_y2, crop_x1:crop_x2]
-            masked = np.full_like(natural, 114)
-            masked[mask_crop] = natural[mask_crop]
-            prompt_box = (
-                float(x - crop_x1),
-                float(y - crop_y1),
-                float(x + width - crop_x1),
-                float(y + height - crop_y1),
+                image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)
+                mask = cv2.resize(
+                    mask.astype(np.uint8),
+                    resized_size,
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+
+            prototypes.append(
+                ReferencePrototype(
+                    image=image,
+                    mask=mask,
+                    object_index=object_index,
+                    path=path,
+                    uses_sam_mask=uses_sam_mask,
+                )
             )
-            for kind, variant_image in (("natural", natural), ("masked", masked)):
-                variants.append(
-                    ReferencePromptVariant(
-                        image=variant_image,
-                        box=prompt_box,
-                        class_index=class_index,
-                        path=path,
-                        kind=kind,
-                    )
-                )
-    return variants
-
-
-def build_reference_gallery(
-    reference_groups: Iterable[tuple[Path, ...]],
-    gallery_size: int,
-    reference_masks: dict[Path, np.ndarray] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Place natural/masked views into a gallery with shared per-object IDs."""
-    if gallery_size < 128:
-        raise ValueError("reference gallery size must be at least 128 pixels")
-    groups = list(reference_groups)
-    variants = _build_reference_variants(groups, reference_masks)
-    if not variants:
+    if not prototypes:
         raise ValueError("At least one reference image is required")
-
-    columns = math.ceil(math.sqrt(len(variants)))
-    rows = math.ceil(len(variants) / columns)
-    cell_width = gallery_size // columns
-    cell_height = gallery_size // rows
-    padding = max(2, min(cell_width, cell_height) // 32)
-    if cell_width <= padding * 2 or cell_height <= padding * 2:
-        raise ValueError("Too many references for the selected gallery size")
-
-    gallery = np.full((gallery_size, gallery_size, 3), 114, dtype=np.uint8)
-    boxes: list[list[float]] = []
-    classes: list[int] = []
-    for index, variant in enumerate(variants):
-        image = variant.image
-        row, column = divmod(index, columns)
-        available_width = cell_width - padding * 2
-        available_height = cell_height - padding * 2
-        scale = min(
-            available_width / image.shape[1],
-            available_height / image.shape[0],
-        )
-        resized_width = max(1, round(image.shape[1] * scale))
-        resized_height = max(1, round(image.shape[0] * scale))
-        resized = cv2.resize(
-            image,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
-        )
-        x1 = column * cell_width + (cell_width - resized_width) // 2
-        y1 = row * cell_height + (cell_height - resized_height) // 2
-        x2, y2 = x1 + resized_width, y1 + resized_height
-        gallery[y1:y2, x1:x2] = resized
-        box_x1, box_y1, box_x2, box_y2 = variant.box
-        boxes.append(
-            [
-                float(x1 + box_x1 * scale),
-                float(y1 + box_y1 * scale),
-                float(x1 + box_x2 * scale),
-                float(y1 + box_y2 * scale),
-            ]
-        )
-        classes.append(variant.class_index)
-    return (
-        gallery,
-        np.asarray(boxes, dtype=np.float32),
-        np.asarray(classes, dtype=np.int32),
-    )
+    return prototypes
 
 
 def _mask_border_contact(mask: np.ndarray) -> float:
@@ -484,21 +429,22 @@ def extract_reference_masks_with_sam(
 
 def _fixed_prompt_onnx_path(
     model_source: str,
-    gallery: np.ndarray,
-    prompt_boxes: np.ndarray,
-    prompt_classes: np.ndarray,
+    prototypes: Iterable[ReferencePrototype],
     *,
     yolo_imgsz: int,
     yolo_reference_imgsz: int,
 ) -> Path:
     """Return a content-addressed cache path for a fixed-prompt FP32 export."""
     digest = hashlib.sha256()
-    digest.update(b"yoloe-fixed-visual-prompts-natural-masked-v1")
+    digest.update(b"yoloe-fixed-visual-prompts-exact-mask-per-reference-v2")
     digest.update(str(yolo_imgsz).encode())
     digest.update(str(yolo_reference_imgsz).encode())
-    digest.update(gallery.tobytes())
-    digest.update(prompt_boxes.tobytes())
-    digest.update(prompt_classes.tobytes())
+    for prototype in prototypes:
+        digest.update(np.asarray(prototype.image.shape, dtype=np.int32).tobytes())
+        digest.update(prototype.image.tobytes())
+        digest.update(np.asarray(prototype.mask.shape, dtype=np.int32).tobytes())
+        digest.update(np.packbits(prototype.mask).tobytes())
+        digest.update(str(prototype.object_index).encode())
     model_path = Path(model_source)
     if model_path.is_file():
         with model_path.open("rb") as stream:
@@ -510,6 +456,138 @@ def _fixed_prompt_onnx_path(
     cache_directory.mkdir(parents=True, exist_ok=True)
     model_stem = model_path.stem or "yoloe"
     return cache_directory / f"{model_stem}-{digest.hexdigest()[:16]}-fp32.onnx"
+
+
+def encode_reference_prototypes(
+    model: Any,
+    prototypes: Iterable[ReferencePrototype],
+    *,
+    predictor_type: type,
+    device: str | int,
+    imgsz: int,
+    torch_module: Any,
+) -> tuple[int, ...]:
+    """Extract one exact-mask VPE per photo and install them as pseudo-classes."""
+    prototype_list = list(prototypes)
+    if not prototype_list:
+        raise ValueError("At least one reference prototype is required")
+
+    class ExactMaskPredictor(predictor_type):
+        """Rasterize masks with the same letterbox geometry as the reference."""
+
+        def _process_single_image(
+            self,
+            dst_shape: tuple[int, int],
+            src_shape: tuple[int, int],
+            category: np.ndarray,
+            bboxes: np.ndarray | None = None,
+            masks: np.ndarray | None = None,
+        ) -> Any:
+            if masks is None:
+                return super()._process_single_image(
+                    dst_shape,
+                    src_shape,
+                    category,
+                    bboxes,
+                    masks,
+                )
+            mask_values = np.asarray(masks, dtype=np.uint8)
+            if mask_values.ndim == 2:
+                mask_values = mask_values[None, ...]
+            if mask_values.ndim != 3 or mask_values.shape[1:] != src_shape:
+                raise ValueError(
+                    f"Expected reference masks shaped (N, {src_shape[0]}, {src_shape[1]}), "
+                    f"got {mask_values.shape}"
+                )
+            categories = np.asarray(category, dtype=np.int32).reshape(-1)
+            if len(categories) != len(mask_values):
+                raise ValueError("Reference masks and classes must have equal length")
+
+            dst_height, dst_width = dst_shape
+            src_height, src_width = src_shape
+            gain = min(dst_height / src_height, dst_width / src_width)
+            resized_width = max(1, round(src_width * gain))
+            resized_height = max(1, round(src_height * gain))
+            left = round((dst_width - resized_width) / 2 - 0.1)
+            top = round((dst_height - resized_height) / 2 - 0.1)
+            prompt_height = max(1, int(dst_height / 8))
+            prompt_width = max(1, int(dst_width / 8))
+            unique_categories, inverse = np.unique(categories, return_inverse=True)
+            visuals = np.zeros(
+                (len(unique_categories), prompt_height, prompt_width),
+                dtype=np.float32,
+            )
+            for class_index, mask in zip(inverse, mask_values):
+                resized = cv2.resize(
+                    mask,
+                    (resized_width, resized_height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                letterboxed = np.zeros((dst_height, dst_width), dtype=np.uint8)
+                letterboxed[
+                    top : top + resized_height,
+                    left : left + resized_width,
+                ] = resized
+                prompt_mask = cv2.resize(
+                    letterboxed,
+                    (prompt_width, prompt_height),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+                if not np.any(prompt_mask):
+                    raise ValueError(
+                        "Reference foreground disappeared at the YOLOE prompt "
+                        f"resolution {prompt_width}x{prompt_height}"
+                    )
+                visuals[class_index] = np.logical_or(
+                    visuals[class_index],
+                    prompt_mask,
+                )
+            return torch_module.from_numpy(visuals)
+
+    predictor = ExactMaskPredictor(
+        overrides={
+            "task": model.task,
+            "mode": "predict",
+            "save": False,
+            "verbose": False,
+            "batch": 1,
+            "device": device,
+            "imgsz": imgsz,
+        }
+    )
+    predictor.setup_model(model=model.model, verbose=False)
+
+    embeddings: list[Any] = []
+    prototype_to_object: list[int] = []
+    for prototype_index, prototype in enumerate(prototype_list):
+        predictor.set_prompts(
+            {
+                "masks": np.asarray([prototype.mask], dtype=np.uint8),
+                "cls": np.asarray([0], dtype=np.int32),
+            }
+        )
+        with torch_module.inference_mode():
+            embedding = predictor.get_vpe(prototype.image)
+        if embedding.ndim != 3 or embedding.shape[0] != 1 or embedding.shape[1] != 1:
+            raise RuntimeError(
+                "Expected one visual embedding per reference image, got "
+                f"{tuple(embedding.shape)} for {prototype.path.name}"
+            )
+        embeddings.append(embedding)
+        prototype_to_object.append(prototype.object_index)
+        foreground_ratio = float(np.count_nonzero(prototype.mask)) / prototype.mask.size
+        print(
+            f"YOLOE reference prototype {prototype_index}: {prototype.path.name}, "
+            f"object={prototype.object_index}, exact-mask={prototype.uses_sam_mask}, "
+            f"foreground={foreground_ratio:.1%}"
+        )
+
+    combined = torch_module.cat(embeddings, dim=1)
+    model.set_classes(
+        [f"prototype{index}" for index in range(len(prototype_list))],
+        combined,
+    )
+    return tuple(prototype_to_object)
 
 
 def select_runtime(torch_module: Any, device: str, precision: str) -> RuntimeSelection:
@@ -820,23 +898,23 @@ class YoloEEdgeTamPipeline:
             if reference_sam
             else None
         )
-        gallery, prompt_boxes, prompt_classes = build_reference_gallery(
+        prototypes = build_reference_prototypes(
             reference_groups,
-            reference_size,
             reference_masks,
+            maximum_size=reference_size,
         )
+        self.prototype_to_reference = tuple(
+            prototype.object_index for prototype in prototypes
+        )
+        self.reference_prototypes = len(prototypes)
         self.reference_sam_model = reference_sam_model_id if reference_sam else None
         self.segmented_references = len(reference_masks or ())
-        visual_prompts = {
-            "bboxes": prompt_boxes,
-            "cls": prompt_classes,
-        }
 
         print(
             "Image-prompt runtime: "
             f"device={self.runtime.torch_device}, precision={self.runtime.precision}, "
             f"tracker={self.tracker_mode}, groups={len(reference_groups)}, "
-            f"references={len(reference_paths)}, prompts={len(prompt_boxes)}, "
+            f"references={len(reference_paths)}, prototypes={len(prototypes)}, "
             f"SAM-foreground={self.segmented_references}/{len(reference_paths)}"
         )
         self.yolo_model_source = resolve_yolo_model_source(yolo_model_id)
@@ -855,19 +933,16 @@ class YoloEEdgeTamPipeline:
             )
         )
         def initialize_visual_prompts(model: Any) -> None:
-            model.predict(
-                gallery,
-                refer_image=gallery,
-                visual_prompts=visual_prompts,
-                predictor=YOLOEVPSegPredictor,
-                imgsz=self.yolo_reference_imgsz,
-                # This result is discarded; use a permissive value so prompt
-                # extraction cannot be suppressed by the runtime threshold.
-                conf=0.001,
-                iou=self.yolo_iou,
+            mapping = encode_reference_prototypes(
+                model,
+                prototypes,
+                predictor_type=YOLOEVPSegPredictor,
                 device=self.runtime.yolo_device,
-                verbose=False,
+                imgsz=self.yolo_reference_imgsz,
+                torch_module=torch,
             )
+            if mapping != self.prototype_to_reference:
+                raise RuntimeError("Reference prototype mapping changed during encoding")
 
         if yolo_onnx:
             source_path = Path(self.yolo_model_source)
@@ -875,9 +950,7 @@ class YoloEEdgeTamPipeline:
                 raise ValueError("FP32 ONNX export requires a local YOLOE .pt file")
             onnx_path = _fixed_prompt_onnx_path(
                 self.yolo_model_source,
-                gallery,
-                prompt_boxes,
-                prompt_classes,
+                prototypes,
                 yolo_imgsz=self.yolo_imgsz,
                 yolo_reference_imgsz=self.yolo_reference_imgsz,
             )
@@ -995,6 +1068,9 @@ class YoloEEdgeTamPipeline:
         detections: list[Detection] = []
         for index in order:
             x1, y1, x2, y2 = (float(value) for value in boxes[index])
+            prototype_index = int(classes[index])
+            if not 0 <= prototype_index < len(self.prototype_to_reference):
+                continue
             mask: np.ndarray | None = None
             if mask_values is not None and index < len(mask_values):
                 raw_mask = mask_values[index]
@@ -1009,7 +1085,7 @@ class YoloEEdgeTamPipeline:
                 Detection(
                     box=(x1, y1, x2, y2),
                     confidence=float(confidences[index]),
-                    reference_index=int(classes[index]),
+                    reference_index=self.prototype_to_reference[prototype_index],
                     mask=mask,
                 )
             )
@@ -1388,7 +1464,9 @@ def process_image_prompt_stream(
     if not 0.0 < max_mask_area_ratio <= 1.0:
         raise ValueError("maximum mask area ratio must be greater than 0 and at most 1")
     if yolo_imgsz <= 0 or yolo_reference_imgsz <= 0 or reference_size <= 0:
-        raise ValueError("YOLO frame, YOLO reference, and gallery sizes must be positive")
+        raise ValueError(
+            "YOLO frame, YOLO reference, and reference maximum sizes must be positive"
+        )
     if yolo_imgsz % 32 != 0 or yolo_reference_imgsz % 32 != 0:
         raise ValueError("YOLO input sizes must be divisible by 32")
     if reference_sam and not reference_sam_model_id.strip():
@@ -1594,10 +1672,12 @@ def process_image_prompt_stream(
             "edgetam_model": pipeline.edgetam_model_source,
             "reference_sam_model": pipeline.reference_sam_model,
             "segmented_references": pipeline.segmented_references,
+            "reference_prototypes": pipeline.reference_prototypes,
+            "reference_prompt_policy": "exact_mask_per_photo_max_over_prototypes",
             "input_sizes": {
                 "yoloe_frames": yolo_imgsz,
                 "yoloe_references": yolo_reference_imgsz,
-                "reference_gallery": reference_size,
+                "reference_maximum_side": reference_size,
                 "edgetam": edgetam_imgsz if pipeline.tracker_mode == "edgetam" else None,
             },
         },
