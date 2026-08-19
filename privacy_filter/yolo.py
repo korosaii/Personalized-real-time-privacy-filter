@@ -81,7 +81,13 @@ class YOLOFaceDetector:
             value.dim_value if value.HasField("dim_value") else 0
             for value in output_dimensions
         ]
-        self.has_landmarks = 20 in output_shape
+        if 20 in output_shape:
+            self.output_format = "yolo11_pose"
+        elif 16 in output_shape:
+            self.output_format = "yolov5_face"
+        else:
+            self.output_format = "yolo_detect"
+        self.has_landmarks = self.output_format in {"yolo11_pose", "yolov5_face"}
         self.detection_width = 20 if self.has_landmarks else 5
         self.threshold = float(threshold)
         self.nms_threshold = float(nms_threshold)
@@ -180,19 +186,35 @@ class YOLOFaceDetector:
             detections = rows[:, :5].copy()
             detections = detections[detections[:, 4] >= self.threshold]
         else:
-            if self.has_landmarks:
+            if self.output_format == "yolo11_pose":
                 if rows.shape[1] != 20:
                     raise ValueError(
                         f"Expected YOLO Pose predictions with 20 values, got {rows.shape}"
                     )
                 scores = rows[:, 4]
+            elif self.output_format == "yolov5_face":
+                if rows.shape[1] != 16:
+                    raise ValueError(
+                        f"Expected YOLOv5-Face predictions with 16 values, got {rows.shape}"
+                    )
+                scores = rows[:, 4] * rows[:, 15]
             else:
                 scores = rows[:, 4:].max(axis=1)
             positive = scores >= self.threshold
             boxes = rows[positive, :4]
             scores = scores[positive]
-            if self.has_landmarks:
+            if self.output_format == "yolo11_pose":
                 landmarks = rows[positive, 5:20].reshape(-1, 5, 3).copy()
+            elif self.output_format == "yolov5_face":
+                landmark_points = rows[positive, 5:15].reshape(-1, 5, 2)
+                landmark_confidence = np.ones(
+                    (len(landmark_points), 5, 1),
+                    dtype=np.float32,
+                )
+                landmarks = np.concatenate(
+                    (landmark_points, landmark_confidence),
+                    axis=2,
+                )
             if not len(boxes):
                 return np.empty((0, self.detection_width), dtype=np.float32)
             centers_x, centers_y, widths, heights = boxes.T

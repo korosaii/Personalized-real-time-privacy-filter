@@ -11,19 +11,17 @@ from .ort_session import preferred_execution_provider
 
 
 DETECTOR_MODEL_ALIASES = {
+    "yolo11face": Path("models/detector/yolov11n-face-pose-roll90.onnx"),
     "yolo11": Path("models/detector/yolov11n-face.onnx"),
-    "yolo11-pose": Path("models/detector/yolov11n-face-pose.onnx"),
-    "yolo11-pose-roll90": Path(
-        "models/detector/yolov11n-face-pose-roll90.onnx"
-    ),
+    "yolov5-face": Path("models/detector/yolov5-face.onnx"),
 }
-DEFAULT_DETECTOR_MODEL = "yolo11"
+DEFAULT_DETECTOR_MODEL = "yolo11face"
 RECOGNITION_MODEL_ALIASES = {
-    "r34-glint360k": Path("models/recognition/iresnet_r34_glint360k.onnx"),
-    "r100-glint360k": Path("models/recognition/iresnet_r100_glint360k.onnx"),
+    "iresnet50": Path("models/recognition/webface_r50.onnx"),
+    "r100-glint360k": Path("models/recognition/glintr100.onnx"),
     "r50-webface600k": Path("models/recognition/webface_r50.onnx"),
 }
-DEFAULT_RECOGNITION_MODEL = "r34-glint360k"
+DEFAULT_RECOGNITION_MODEL = "iresnet50"
 
 
 @dataclass(frozen=True)

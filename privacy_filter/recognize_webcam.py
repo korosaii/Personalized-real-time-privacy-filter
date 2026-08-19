@@ -17,6 +17,12 @@ import numpy as np
 from .camera import Camera, VideoFile
 from .enrollment import load_gallery, safe_identity_name, sha256_file
 from .enroll_cli import enroll_photos, expand_photos
+from .face_overlays import (
+    commit_statistics_canvas as _commit_statistics_frame,
+    draw_runtime_metrics as _draw_metrics,
+    draw_track_overlay as _draw_label,
+    statistics_canvas as _statistics_frame,
+)
 from .lighting import LightingMode, classify_lighting, measure_lighting
 from .model_setup import (
     RuntimeModels,
@@ -27,7 +33,6 @@ from .model_setup import (
 from .ort_session import PROVIDER_CHOICES
 from .recognition import (
     FACE_PREPROCESSING,
-    FACE_ROTATION_ANGLES,
     LANDMARK_FACE_PREPROCESSING,
     FaceEmbedder,
 )
@@ -137,13 +142,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--detector-model",
         "--detector",
-        default="yolo11",
+        default="yolo11face",
         help=detector_model_help(),
     )
     parser.add_argument(
         "--recognition-model",
         "--model",
-        default="r34-glint360k",
+        default="iresnet50",
         help=recognition_model_help(),
     )
     parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
@@ -166,8 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-prompt-video",
         action="store_true",
         help=(
-            "Use YOLOE visual prompts and EdgeTAM tracking on a video file or "
-            "the webcam"
+            "Use SAM reference masks and YOLOE visual prompts on a video file "
+            "or the webcam"
         ),
     )
     parser.add_argument(
@@ -223,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="configs/sam2.1/sam2.1_hiera_s.yaml",
     )
     parser.add_argument("--video-pixel-block-size", type=int, default=16)
-    image_prompt = parser.add_argument_group("YOLOE + EdgeTAM image-prompt mode")
+    image_prompt = parser.add_argument_group("SAM + YOLOE image-prompt mode")
     image_prompt.add_argument(
         "--reference-image",
         type=Path,
@@ -245,14 +250,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Bake the current visual prompts into a cached FP32 ONNX model; "
             "changing references creates a new cache entry"
-        ),
-    )
-    image_prompt.add_argument(
-        "--image-edgetam-model",
-        default="yonigozlan/EdgeTAM-hf",
-        help=(
-            "Transformers-compatible EdgeTAM model ID or local directory; "
-            "facebook/EdgeTAM main contains only the original checkpoint"
         ),
     )
     image_prompt.add_argument(
@@ -280,28 +277,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Square YOLOE input used once for each reference prototype",
     )
     image_prompt.add_argument(
-        "--image-edgetam-imgsz",
-        type=int,
-        default=1024,
-        help=(
-            "Square EdgeTAM input from 256 to 1024, divisible by 64; "
-            "lower values are faster but reduce mask quality"
-        ),
-    )
-    image_prompt.add_argument(
         "--image-reference-size",
         type=int,
         default=1280,
         help="Maximum side of each independently encoded reference image",
-    )
-    image_prompt.add_argument(
-        "--image-reference-sam",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Run SAM 2 once at startup to create exact foreground prompts; disable "
-            "with --no-image-reference-sam to use each full image as its prompt"
-        ),
     )
     image_prompt.add_argument(
         "--image-reference-sam-model",
@@ -331,51 +310,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_prompt.add_argument("--image-yolo-confidence", type=float, default=0.10)
     image_prompt.add_argument("--image-yolo-iou", type=float, default=0.50)
-    image_prompt.add_argument(
-        "--image-edgetam-score-threshold",
-        type=float,
-        default=0.50,
-        help="Minimum sigmoid object-presence score from EdgeTAM",
-    )
-    image_prompt.add_argument(
-        "--image-mask-threshold",
-        type=float,
-        default=0.0,
-        help="EdgeTAM mask-logit threshold; 0.0 corresponds to probability 0.5",
-    )
     image_prompt.add_argument("--image-min-mask-area", type=int, default=64)
     image_prompt.add_argument(
         "--image-max-mask-area-ratio",
         type=float,
         default=0.98,
         help=(
-            "Reject an EdgeTAM mask covering more than this fraction of the frame; "
+            "Reject a YOLOE mask covering more than this fraction of the frame; "
             "prevents accidental full-frame redaction"
         ),
     )
     image_prompt.add_argument("--image-max-objects", type=int, default=20)
     image_prompt.add_argument(
-        "--image-redetect-interval",
-        type=int,
-        default=5,
-        help="Run YOLOE every N frames; EdgeTAM tracks between keyframes",
-    )
-    image_prompt.add_argument(
-        "--image-tracker",
-        choices=("auto", "edgetam", "iou"),
-        default="auto",
-        help=(
-            "auto uses IoU on CPU and EdgeTAM on CUDA/MPS; iou runs YOLOE-seg "
-            "on every frame without loading EdgeTAM"
-        ),
-    )
-    image_prompt.add_argument(
         "--no-image-tracker",
-        dest="image_tracker",
-        action="store_const",
-        const="iou",
-        default=argparse.SUPPRESS,
-        help="Disable EdgeTAM and use lightweight IoU association",
+        action="store_true",
+        help="Compatibility flag; SAM + YOLOE always uses lightweight IoU association",
     )
     image_prompt.add_argument(
         "--image-iou-threshold",
@@ -395,12 +344,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Expand the final mask by this many pixels to cover boundaries",
     )
-    image_prompt.add_argument(
-        "--image-fallback-frames",
-        type=int,
-        default=3,
-        help="Reuse the last valid mask for this many temporarily lost frames",
-    )
     image_prompt.add_argument("--image-pixel-block-size", type=int, default=16)
     image_prompt.add_argument(
         "--image-redaction",
@@ -419,14 +362,6 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Pixelate the entire frame when inference raises an error",
-    )
-    image_prompt.add_argument(
-        "--image-diagnostic-overlay",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Draw rolling FPS and YOLOE/EdgeTAM values above every tracked object"
-        ),
     )
     parser.add_argument(
         "--mirror",
@@ -449,9 +384,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--rotations",
-        action="store_true",
-        help="Use a template enrolled with 30/90/180/270/330-degree rotations",
+        "--bboxes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw face/object bounding boxes; disable with --no-bboxes",
+    )
+    parser.add_argument(
+        "--statistics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw runtime and per-track statistics; disable with --no-statistics",
     )
     parser.add_argument(
         "--authorized-recheck-interval",
@@ -502,8 +444,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tracker",
         choices=("bytetrack", "botsort", "iou"),
-        default="bytetrack",
-        help="Tracking backend; ByteTrack and BoT-SORT are provided by Ultralytics",
+        default="iou",
+        help=(
+            "Tracking backend; lightweight local IoU is the default, while "
+            "ByteTrack and BoT-SORT can be enabled explicitly"
+        ),
     )
     parser.add_argument("--tracker-buffer", type=int, default=30)
     parser.add_argument(
@@ -626,92 +571,6 @@ def _authorization_size_requires_revoke(
     )
 
 
-def _draw_label(
-    frame: np.ndarray,
-    track: FaceTrack,
-    confirmations: int,
-    minimum_face_size: float,
-) -> None:
-    detection = track.detection
-    height, width = frame.shape[:2]
-    x1 = max(0, min(width - 1, int(detection[0])))
-    y1 = max(0, min(height - 1, int(detection[1])))
-    x2 = max(0, min(width - 1, int(detection[2])))
-    y2 = max(0, min(height - 1, int(detection[3])))
-    if track.state is FaceState.AUTHORIZED:
-        color = (70, 230, 70)
-        label = f"#{track.track_id} {track.identity_name or 'OWNER'}"
-    elif track.recognition_block_reason == "face_near_frame_edge":
-        color = (40, 210, 255)
-        label = f"#{track.track_id} WAIT FULL FACE"
-    elif track.recognition_block_reason == "track_stabilizing":
-        color = (40, 210, 255)
-        label = f"#{track.track_id} STABILIZING"
-    elif track.overlap_uncertain:
-        color = (40, 70, 255)
-        label = f"#{track.track_id} TRACK UNCERTAIN"
-    elif track.face_size < minimum_face_size:
-        color = (40, 210, 255)
-        label = f"#{track.track_id} TOO SMALL {track.face_size:.0f}px"
-    elif track.state is FaceState.PENDING:
-        color = (40, 210, 255)
-        label = f"#{track.track_id} PENDING {track.positive_streak}/{confirmations}"
-    else:
-        color = (40, 70, 255)
-        label = f"#{track.track_id} UNKNOWN"
-    if track.score is not None:
-        label += f" {track.score:.3f}"
-    if track.matching_centroid_index is not None:
-        label += f" IDX:{track.matching_centroid_index}"
-        if track.matching_rotation_angle is not None:
-            label += f" R:{track.matching_rotation_angle}"
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    text_y = max(22, y1 - 8)
-    cv2.putText(frame, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(frame, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
-
-def _draw_metrics(
-    frame: np.ndarray,
-    rolling_ms: deque[float],
-    detector_ms: float,
-    recognition_ms: float,
-    recognition_calls: int,
-    visible_tracks: int,
-    lighting_modes: tuple[str, ...],
-    threshold: float,
-    difficult_lighting_threshold: float,
-    confirmations: int,
-    authorized_interval: int,
-    minimum_face_size: float,
-) -> None:
-    fps = 1000.0 / float(np.mean(rolling_ms)) if rolling_ms else 0.0
-    lighting_counts = {
-        mode.value: lighting_modes.count(mode.value) for mode in LightingMode
-    }
-    lines = (
-        f"FPS {fps:5.1f}",
-        f"Detector {detector_ms:5.1f} ms  Recognition {recognition_ms:5.1f} ms ({recognition_calls} calls)",
-        (
-            f"Tracks {visible_tracks}  threshold normal:{threshold:.3f} "
-            f"difficult:{difficult_lighting_threshold:.3f}  "
-            f"confirm {confirmations}  min-face {minimum_face_size:.0f}px  "
-            f"recheck {authorized_interval}"
-        ),
-        (
-            "Lighting "
-            f"NORMAL:{lighting_counts[LightingMode.NORMAL.value]}  "
-            f"LOW_LIGHT:{lighting_counts[LightingMode.LOW_LIGHT.value]}  "
-            f"OVEREXPOSED:{lighting_counts[LightingMode.OVEREXPOSED.value]}"
-        ),
-    )
-    y = 28
-    for line in lines:
-        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 230, 80), 2, cv2.LINE_AA)
-        y += 27
-
-
 def _validate_args(args: argparse.Namespace, threshold: float) -> None:
     if not 0.0 < threshold < 1.0:
         raise ValueError("Authorization threshold must be between 0 and 1")
@@ -811,7 +670,6 @@ def auto_enroll_owners(
             models,
             output,
             threshold=0.35 if args.threshold is None else float(args.threshold),
-            rotations=args.rotations,
             min_face_size=args.enrollment_min_face_size,
             min_sharpness=args.enrollment_min_sharpness,
         )
@@ -877,25 +735,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             + ", ".join(mismatched_models)
             + ". Re-run privacy-enroll with the current model."
         )
-    template_angles = tuple(
-        int(value) for value in templates[0].metadata.get("rotation_angles", [0])
-    )
-    expected_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
-    mismatched_rotations = [
-        template.name
-        for template in templates
-        if tuple(
-            int(value) for value in template.metadata.get("rotation_angles", [0])
-        )
-        != expected_angles
-    ]
-    if mismatched_rotations:
-        mode = "with --rotations" if args.rotations else "without --rotations"
-        raise ValueError(
-            "Enrollment rotation mode does not match this launch for: "
-            + ", ".join(mismatched_rotations)
-            + f". Create and select templates enrolled {mode}."
-        )
     owner_thresholds = {
         template.name: (
             template.threshold if args.threshold is None else float(args.threshold)
@@ -921,7 +760,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if template.metadata.get("face_preprocessing") != face_preprocessing
     ]
     if mismatched_preprocessing:
-        mode = "yolo11-pose" if detector.has_landmarks else "yolo11"
+        mode = "yolo11face" if detector.has_landmarks else "yolo11"
         raise ValueError(
             "Enrollment preprocessing does not match the selected detector for: "
             + ", ".join(mismatched_preprocessing)
@@ -947,8 +786,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             f"photo(s), {len(template.embeddings)} embedding(s), "
             f"threshold {owner_thresholds[template.name]:.3f}, {path}"
         )
-    print(f"Rotation mode: {'enabled' if args.rotations else 'disabled'}")
-    print("Template matching: maximum similarity across every owner and rotation centroid.")
+    print("Template matching: maximum similarity across every owner template.")
     print(
         "Authorization thresholds: "
         + ", ".join(
@@ -1285,16 +1123,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     tracker.revocations += 1
             output = redact_entire_frame(frame)
             visible_tracks = []
-            cv2.putText(
-                output,
-                f"FAIL-CLOSED: {type(error).__name__}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (30, 30, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            if args.statistics:
+                statistics_frame = _statistics_frame(output, args.mirror)
+                cv2.putText(
+                    statistics_frame,
+                    f"FAIL-CLOSED: {type(error).__name__}",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (30, 30, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                _commit_statistics_frame(output, statistics_frame, args.mirror)
 
         for track in visible_tracks:
             if track.state is FaceState.AUTHORIZED:
@@ -1305,12 +1146,35 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 pending_observations += 1
             else:
                 unknown_observations += 1
-            _draw_label(
-                output,
-                track,
-                args.confirmations,
-                args.minimum_recognition_face_size,
-            )
+            if args.bboxes:
+                _draw_label(
+                    output,
+                    track,
+                    args.confirmations,
+                    args.minimum_recognition_face_size,
+                    draw_bbox=True,
+                    draw_statistics=False,
+                )
+
+        if args.statistics and visible_tracks:
+            statistics_frame = _statistics_frame(output, args.mirror)
+            frame_width = output.shape[1]
+            for track in visible_tracks:
+                statistics_detection = (
+                    track.detection
+                    if args.mirror
+                    else _unmirror_detection(track.detection, frame_width)
+                )
+                _draw_label(
+                    statistics_frame,
+                    track,
+                    args.confirmations,
+                    args.minimum_recognition_face_size,
+                    draw_bbox=False,
+                    draw_statistics=True,
+                    detection_override=statistics_detection,
+                )
+            _commit_statistics_frame(output, statistics_frame, args.mirror)
 
         processing_ms = (perf_counter() - processing_started) * 1000.0
         detector_latencies.append(detector_ms)
@@ -1351,20 +1215,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             inference_wait_latencies.append(
                 (perf_counter() - inference_wait_started) * 1000.0
             )
-            _draw_metrics(
-                processed.output,
-                rolling_ms,
-                processed.detector_ms,
-                processed.recognition_ms,
-                processed.recognition_calls,
-                processed.visible_tracks,
-                processed.lighting_modes,
-                threshold,
-                difficult_lighting_threshold,
-                args.confirmations,
-                args.authorized_recheck_interval,
-                args.minimum_recognition_face_size,
-            )
+            if args.statistics:
+                statistics_frame = _statistics_frame(processed.output, args.mirror)
+                _draw_metrics(
+                    statistics_frame,
+                    rolling_ms,
+                    processed.detector_ms,
+                    processed.recognition_ms,
+                    processed.recognition_calls,
+                    processed.visible_tracks,
+                    processed.lighting_modes,
+                    threshold,
+                    difficult_lighting_threshold,
+                    args.confirmations,
+                    args.authorized_recheck_interval,
+                    args.minimum_recognition_face_size,
+                )
+                _commit_statistics_frame(
+                    processed.output,
+                    statistics_frame,
+                    args.mirror,
+                )
             if virtual_camera is not None:
                 virtual_camera.submit(processed.output)
             if writer is not None:
@@ -1475,9 +1346,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 virtual_camera.device if virtual_camera is not None else None
             ),
             "realtime_video": args.realtime_video,
-            "rotations": args.rotations,
-            "rotation_angles": list(template_angles),
-            "template_matching_policy": "all_owner_per_rotation_centroid_max",
+            "template_matching_policy": "all_owner_centroid_max",
+            "bboxes": args.bboxes,
+            "statistics": args.statistics,
             "recognition_policy": "size-gated_event-driven_tracker-uncertainty",
             "face_preprocessing": face_preprocessing,
             "pipeline": f"main-thread-{source_kind.replace(' ', '-')}_single-worker-inference",
@@ -1633,8 +1504,8 @@ def main() -> None:
                 raise ValueError("--video-prompt is only used with --offline-video")
             if args.sam2_checkpoint is not None:
                 raise ValueError(
-                    "--sam2-checkpoint belongs to --offline-video; use "
-                    "--image-edgetam-model for image-prompt mode"
+                    "--sam2-checkpoint belongs to --offline-video; image-prompt "
+                    "mode uses --image-reference-sam-model"
                 )
             if args.mirror is None:
                 args.mirror = args.video_path is None
@@ -1657,14 +1528,11 @@ def main() -> None:
                 benchmark_path=Path(args.benchmark_out) if args.benchmark_out else None,
                 yolo_model_id=args.image_yolo_model,
                 yolo_onnx=args.image_yolo_onnx,
-                edgetam_model_id=args.image_edgetam_model,
                 device=args.image_device,
                 precision=args.image_precision,
                 yolo_imgsz=args.image_yolo_imgsz,
                 yolo_reference_imgsz=args.image_yolo_reference_imgsz,
-                edgetam_imgsz=args.image_edgetam_imgsz,
                 reference_size=args.image_reference_size,
-                reference_sam=args.image_reference_sam,
                 reference_sam_model_id=args.image_reference_sam_model,
                 reference_sam_points=args.image_reference_sam_points,
                 reference_sam_min_area_ratio=(
@@ -1675,20 +1543,16 @@ def main() -> None:
                 ),
                 yolo_confidence=args.image_yolo_confidence,
                 yolo_iou=args.image_yolo_iou,
-                edgetam_score_threshold=args.image_edgetam_score_threshold,
-                mask_threshold=args.image_mask_threshold,
                 min_mask_area=args.image_min_mask_area,
                 max_mask_area_ratio=args.image_max_mask_area_ratio,
                 max_objects=args.image_max_objects,
-                redetect_interval=args.image_redetect_interval,
                 mask_dilation=args.image_mask_dilation,
-                fallback_frames=args.image_fallback_frames,
                 pixel_block_size=args.image_pixel_block_size,
                 blur_kernel_size=args.image_blur_kernel_size,
                 redaction_mode=args.image_redaction,
                 fail_closed=args.image_fail_closed,
-                diagnostic_overlay=args.image_diagnostic_overlay,
-                tracker_mode=args.image_tracker,
+                show_bboxes=args.bboxes,
+                show_statistics=args.statistics,
                 iou_threshold=args.image_iou_threshold,
                 iou_max_missed=args.image_iou_max_missed,
             )

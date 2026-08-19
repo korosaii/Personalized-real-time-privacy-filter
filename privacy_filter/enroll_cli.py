@@ -23,10 +23,8 @@ from .model_setup import (
 from .ort_session import PROVIDER_CHOICES
 from .recognition import (
     FACE_PREPROCESSING,
-    FACE_ROTATION_ANGLES,
     LANDMARK_FACE_PREPROCESSING,
     FaceEmbedder,
-    rotate_face,
 )
 from .yolo import YOLOFaceDetector
 
@@ -49,22 +47,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--detector-model",
         "--detector",
-        default="yolo11",
+        default="yolo11face",
         help=detector_model_help(),
     )
     parser.add_argument(
         "--recognition-model",
         "--model",
-        default="r34-glint360k",
+        default="iresnet50",
         help=recognition_model_help(),
     )
     parser.add_argument("--provider", choices=PROVIDER_CHOICES, default="auto")
     parser.add_argument("--threshold", type=float, default=0.35)
-    parser.add_argument(
-        "--rotations",
-        action="store_true",
-        help="Add 30/90/180/270/330-degree enrollment rotations",
-    )
     parser.add_argument("--min-face-size", type=float, default=80.0)
     parser.add_argument("--min-sharpness", type=float, default=25.0)
     return parser
@@ -132,7 +125,6 @@ def embedding_from_photo(
     embedder: FaceEmbedder,
     min_face_size: float,
     min_sharpness: float,
-    use_rotations: bool,
 ) -> tuple[np.ndarray | None, str]:
     photo = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if photo is None:
@@ -142,7 +134,10 @@ def embedding_from_photo(
     face_count = len(detected.detections)
     if face_count != 1:
         return None, f"expected exactly one face, found {face_count}"
-    face_image = embedder.extract_face(photo, detected.detections[0])
+    try:
+        face_image = embedder.extract_face(photo, detected.detections[0])
+    except ValueError as error:
+        return None, f"face alignment failed: {error}"
     quality = assess_face_quality(
         face_image,
         detected.detections[0],
@@ -151,12 +146,8 @@ def embedding_from_photo(
     )
     if not quality.accepted:
         return None, quality.reason
-    rotation_angles = FACE_ROTATION_ANGLES if use_rotations else (0,)
-    embeddings = [
-        embedder.embed_face(rotate_face(face_image, angle))[0]
-        for angle in rotation_angles
-    ]
-    return np.stack(embeddings).astype(np.float32), "accepted"
+    embedding = embedder.embed_face(face_image)[0]
+    return embedding[None, :].astype(np.float32), "accepted"
 
 
 def is_new_sample(candidate: np.ndarray, accepted: list[np.ndarray]) -> bool:
@@ -176,7 +167,6 @@ def enroll_photos(
     output: Path,
     *,
     threshold: float = 0.35,
-    rotations: bool = False,
     min_face_size: float = 80.0,
     min_sharpness: float = 25.0,
 ) -> tuple[Path, int, int]:
@@ -190,7 +180,6 @@ def enroll_photos(
             embedder,
             min_face_size,
             min_sharpness,
-            rotations,
         )
         if embedding is None:
             rejected += 1
@@ -221,7 +210,7 @@ def enroll_photos(
             if detector.has_landmarks
             else FACE_PREPROCESSING
         ),
-        rotation_angles=FACE_ROTATION_ANGLES if rotations else (0,),
+        rotation_angles=(0,),
     )
     saved = save_template(template, output)
     return saved, len(accepted), rejected
@@ -250,7 +239,6 @@ def main() -> None:
         models,
         output,
         threshold=args.threshold,
-        rotations=args.rotations,
         min_face_size=args.min_face_size,
         min_sharpness=args.min_sharpness,
     )
@@ -258,20 +246,10 @@ def main() -> None:
     print()
     print(f"Template saved: {saved}")
     print(f"Accepted photos: {accepted_count}; rejected: {rejected}")
-    rotation_angles = FACE_ROTATION_ANGLES if args.rotations else (0,)
     print(
         f"Template embeddings: {len(template.embeddings)} "
-        f"({accepted_count} photos x {len(rotation_angles)} orientation(s))"
+        f"({accepted_count} photo(s))"
     )
-    print(
-        "Rotation centroid indices: "
-        + ", ".join(
-            f"{index}={angle}deg"
-            for index, angle in enumerate(template.rotation_angles)
-        )
-    )
-    print(f"Rotation centroids: {len(template.rotation_centroids)}")
-    print(f"Rotation angles: {list(rotation_angles)} degrees")
     print(f"Initial authorization threshold: {template.threshold:.3f}")
     print("No source photograph was copied into the template.")
     if accepted_count == 1:

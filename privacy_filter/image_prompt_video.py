@@ -25,8 +25,6 @@ IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_ROOT = PROJECT_ROOT / "models"
 DEFAULT_YOLOE_PATH = MODELS_ROOT / "yoloe" / "yoloe-26n-seg.pt"
-DEFAULT_EDGETAM_REPO = "yonigozlan/EdgeTAM-hf"
-DEFAULT_EDGETAM_PATH = MODELS_ROOT / "edgetam" / "EdgeTAM-hf"
 
 
 @dataclass(frozen=True)
@@ -65,13 +63,10 @@ class ObjectAnnotation:
 class FrameResult:
     mask: np.ndarray
     yolo_ms: float
-    edgetam_ms: float
     detections: int
-    keyframe: bool
     used_fallback: bool
     objects: tuple[ObjectAnnotation, ...]
     rejected_masks: int = 0
-    tracker_kind: str = "edgetam"
 
 
 @dataclass(frozen=True)
@@ -105,48 +100,6 @@ def resolve_yolo_model_source(value: str | Path) -> str:
         )
     candidate.parent.mkdir(parents=True, exist_ok=True)
     return str(candidate.resolve())
-
-
-def materialize_edgetam_source(model_id_or_path: str) -> str:
-    """Download a Hub EdgeTAM snapshot into models/edgetam or use a local model."""
-    candidate = Path(model_id_or_path).expanduser()
-    if candidate.is_dir():
-        return str(candidate.resolve())
-
-    normalized = model_id_or_path.replace("\\", "/")
-    parts = [part for part in normalized.split("/") if part]
-    if len(parts) != 2 or Path(model_id_or_path).is_absolute():
-        raise FileNotFoundError(f"Local EdgeTAM model directory not found: {candidate}")
-
-    repo_id = "/".join(parts)
-    local_dir = (
-        DEFAULT_EDGETAM_PATH
-        if repo_id == DEFAULT_EDGETAM_REPO
-        else MODELS_ROOT / "edgetam" / parts[-1]
-    )
-    required_files = (
-        local_dir / "config.json",
-        local_dir / "preprocessor_config.json",
-        local_dir / "model.safetensors",
-    )
-    if all(path.is_file() for path in required_files):
-        return str(local_dir.resolve())
-
-    try:
-        from huggingface_hub import snapshot_download
-    except (ImportError, ModuleNotFoundError) as error:
-        raise RuntimeError(
-            "huggingface_hub is required to download EdgeTAM into models/edgetam"
-        ) from error
-
-    local_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading EdgeTAM {repo_id} to {local_dir.resolve()}")
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=local_dir,
-        allow_patterns=("*.json", "*.safetensors"),
-    )
-    return str(local_dir.resolve())
 
 
 def resolve_reference_groups(values: Iterable[str | Path]) -> list[tuple[Path, ...]]:
@@ -366,8 +319,7 @@ def extract_reference_masks_with_sam(
     except (ImportError, ModuleNotFoundError) as error:
         raise RuntimeError(
             "Reference extraction requires the official facebookresearch/sam2 "
-            "package. Reinstall requirements.txt or disable it with "
-            "--no-image-reference-sam."
+            "package. Reinstall requirements.txt."
         ) from error
 
     print(f"Loading one-shot reference SAM 2: {model_id}")
@@ -621,7 +573,7 @@ def select_runtime(torch_module: Any, device: str, precision: str) -> RuntimeSel
         else:
             requested_precision = "fp32"
     if requested_device == "cpu" and requested_precision == "fp16":
-        raise ValueError("fp16 is not supported for this EdgeTAM CPU pipeline; use fp32")
+        raise ValueError("fp16 is not supported for this CPU pipeline; use fp32")
     if requested_precision == "bf16" and requested_device == "mps":
         raise ValueError("bf16 is not supported by this MPS pipeline; use fp16")
     if (
@@ -641,26 +593,6 @@ def _torch_dtype(torch_module: Any, precision: str) -> Any:
         "fp16": torch_module.float16,
         "bf16": torch_module.bfloat16,
     }[precision]
-
-
-def configure_edgetam_resolution(config: Any, image_size: int) -> Any:
-    """Keep all EdgeTAM spatial config fields consistent for custom inference size."""
-    if image_size < 256 or image_size > 1024 or image_size % 64 != 0:
-        raise ValueError(
-            "EdgeTAM input size must be from 256 to 1024 and divisible by 64"
-        )
-    config.image_size = image_size
-    config.prompt_encoder_config.image_size = image_size
-    config.vision_config.backbone_feature_sizes = [
-        [image_size // 4, image_size // 4],
-        [image_size // 8, image_size // 8],
-        [image_size // 16, image_size // 16],
-    ]
-    config.memory_attention_rope_feat_sizes = [
-        image_size // 16,
-        image_size // 16,
-    ]
-    return config
 
 
 def _validate_unit_interval(name: str, value: float) -> None:
@@ -699,34 +631,37 @@ def draw_diagnostics(
     processing_ms: float,
     runtime: RuntimeSelection,
     error: bool = False,
+    show_bboxes: bool = True,
+    show_statistics: bool = True,
+    mirror_statistics: bool = False,
 ) -> np.ndarray:
-    """Draw rolling performance and per-object detector/tracker values."""
+    """Draw independently configurable boxes and diagnostic text."""
     output = frame.copy()
+    if result is not None and show_bboxes:
+        for annotation in result.objects:
+            color = (0, 200, 255) if result.used_fallback else (50, 230, 80)
+            x1, y1, x2, y2 = annotation.box
+            cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+    if not show_statistics:
+        return output
+
+    canvas = cv2.flip(output, 1) if mirror_statistics else output
     if result is None:
         status = "ERROR: fail-closed"
         yolo_text = "-"
-        edge_text = "-"
         object_count = 0
     else:
         if result.rejected_masks:
             status = f"rejected-large-mask:{result.rejected_masks}"
         else:
-            status = "fallback" if result.used_fallback else (
-                "keyframe" if result.keyframe else "tracking"
-            )
-        yolo_text = f"{result.yolo_ms:.1f}" if result.keyframe else "skip"
-        edge_text = f"{result.edgetam_ms:.1f}" if result.edgetam_ms else "-"
+            status = "fallback" if result.used_fallback else "detected"
+        yolo_text = f"{result.yolo_ms:.1f}"
         object_count = len(result.objects)
     if error:
         status = "ERROR: fail-closed"
-    tracker_metric = (
-        f"EdgeTAM {edge_text} ms"
-        if result is None or result.tracker_kind == "edgetam"
-        else "IoU matching"
-    )
     header = (
         f"FPS {fps:.1f} | frame {processing_ms:.1f} ms | "
-        f"YOLOE {yolo_text} ms | {tracker_metric} | "
+        f"YOLOE {yolo_text} ms | IoU matching | "
         f"objects {object_count} | {runtime.torch_device}/{runtime.precision} | {status}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -739,14 +674,14 @@ def draw_diagnostics(
         thickness,
     )
     cv2.rectangle(
-        output,
+        canvas,
         (5, 5),
-        (min(output.shape[1] - 1, text_width + 17), text_height + baseline + 15),
+        (min(canvas.shape[1] - 1, text_width + 17), text_height + baseline + 15),
         (20, 20, 20),
         thickness=-1,
     )
     cv2.putText(
-        output,
+        canvas,
         header,
         (11, text_height + 10),
         font,
@@ -757,11 +692,14 @@ def draw_diagnostics(
     )
 
     if result is None:
-        return output
+        return cv2.flip(canvas, 1) if mirror_statistics else canvas
     for annotation in result.objects:
-        x1, y1, x2, y2 = annotation.box
+        original_x1, y1, original_x2, _ = annotation.box
+        if mirror_statistics:
+            x1 = canvas.shape[1] - original_x2
+        else:
+            x1 = original_x1
         color = (0, 200, 255) if result.used_fallback else (50, 230, 80)
-        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         reference = (
             str(annotation.reference_index + 1)
             if annotation.reference_index >= 0
@@ -772,10 +710,9 @@ def draw_diagnostics(
             if annotation.tracker_score is not None
             else "n/a"
         )
-        score_name = "edge" if result.tracker_kind == "edgetam" else "iou"
         label = (
             f"id={annotation.track_id} ref={reference} "
-            f"yolo={annotation.detector_confidence:.2f} {score_name}={edge_score}"
+            f"yolo={annotation.detector_confidence:.2f} iou={edge_score}"
         )
         if result.used_fallback:
             label += " fallback"
@@ -787,14 +724,14 @@ def draw_diagnostics(
         )
         label_y = max(label_height + label_baseline + 4, y1)
         cv2.rectangle(
-            output,
+            canvas,
             (x1, label_y - label_height - label_baseline - 4),
-            (min(output.shape[1] - 1, x1 + label_width + 6), label_y + 2),
+            (min(canvas.shape[1] - 1, x1 + label_width + 6), label_y + 2),
             (20, 20, 20),
             thickness=-1,
         )
         cv2.putText(
-            output,
+            canvas,
             label,
             (x1 + 3, label_y - label_baseline),
             font,
@@ -803,39 +740,31 @@ def draw_diagnostics(
             thickness,
             cv2.LINE_AA,
         )
-    return output
+    return cv2.flip(canvas, 1) if mirror_statistics else canvas
 
 
-class YoloEEdgeTamPipeline:
+class YoloESamPipeline:
     def __init__(
         self,
         *,
         reference_groups: list[tuple[Path, ...]],
         yolo_model_id: str,
         yolo_onnx: bool,
-        edgetam_model_id: str,
         device: str,
         precision: str,
         yolo_imgsz: int,
         yolo_reference_imgsz: int,
-        edgetam_imgsz: int,
         reference_size: int,
-        reference_sam: bool,
         reference_sam_model_id: str,
         reference_sam_points: int,
         reference_sam_min_area_ratio: float,
         reference_sam_max_area_ratio: float,
         yolo_confidence: float,
         yolo_iou: float,
-        edgetam_score_threshold: float,
-        mask_threshold: float,
         min_mask_area: int,
         max_mask_area_ratio: float,
         max_objects: int,
-        redetect_interval: int,
         mask_dilation: int,
-        fallback_frames: int,
-        tracker_mode: str,
         iou_threshold: float,
         iou_max_missed: int,
     ) -> None:
@@ -851,52 +780,30 @@ class YoloEEdgeTamPipeline:
 
         self.torch = torch
         self.runtime = select_runtime(torch, device, precision)
-        self.tracker_mode = (
-            "edgetam"
-            if tracker_mode == "auto" and self.runtime.torch_device in {"cuda", "mps"}
-            else "iou" if tracker_mode == "auto" else tracker_mode
-        )
-        if self.tracker_mode not in {"edgetam", "iou"}:
-            raise ValueError("image tracker must be auto, edgetam, or iou")
         self.dtype = _torch_dtype(torch, self.runtime.precision)
         self.yolo_imgsz = yolo_imgsz
         self.yolo_reference_imgsz = yolo_reference_imgsz
-        self.edgetam_imgsz = edgetam_imgsz
         self.yolo_confidence = yolo_confidence
         self.yolo_iou = yolo_iou
-        self.edgetam_score_threshold = edgetam_score_threshold
-        self.mask_threshold = mask_threshold
         self.min_mask_area = min_mask_area
         self.max_mask_area_ratio = max_mask_area_ratio
         self.max_objects = max_objects
-        self.redetect_interval = redetect_interval
         self.mask_dilation = mask_dilation
-        self.fallback_frames = fallback_frames
         self.iou_threshold = iou_threshold
         self.iou_max_missed = iou_max_missed
         self.frame_index = 0
-        self.frames_since_detection = redetect_interval
-        self.session: Any | None = None
-        self.last_mask: np.ndarray | None = None
-        self.last_objects: tuple[ObjectAnnotation, ...] = ()
-        self.object_metadata: dict[int, Detection] = {}
         self.iou_tracks: dict[int, IouTrack] = {}
         self.next_iou_track_id = 1
-        self.fallback_age = 0
         reference_paths = [path for group in reference_groups for path in group]
 
-        reference_masks = (
-            extract_reference_masks_with_sam(
-                reference_paths,
-                model_id=reference_sam_model_id,
-                runtime=self.runtime,
-                torch_module=torch,
-                points_per_side=reference_sam_points,
-                minimum_area_ratio=reference_sam_min_area_ratio,
-                maximum_area_ratio=reference_sam_max_area_ratio,
-            )
-            if reference_sam
-            else None
+        reference_masks = extract_reference_masks_with_sam(
+            reference_paths,
+            model_id=reference_sam_model_id,
+            runtime=self.runtime,
+            torch_module=torch,
+            points_per_side=reference_sam_points,
+            minimum_area_ratio=reference_sam_min_area_ratio,
+            maximum_area_ratio=reference_sam_max_area_ratio,
         )
         prototypes = build_reference_prototypes(
             reference_groups,
@@ -907,30 +814,24 @@ class YoloEEdgeTamPipeline:
             prototype.object_index for prototype in prototypes
         )
         self.reference_prototypes = len(prototypes)
-        self.reference_sam_model = reference_sam_model_id if reference_sam else None
+        self.reference_sam_model = reference_sam_model_id
         self.segmented_references = len(reference_masks or ())
 
         print(
             "Image-prompt runtime: "
             f"device={self.runtime.torch_device}, precision={self.runtime.precision}, "
-            f"tracker={self.tracker_mode}, groups={len(reference_groups)}, "
+            f"tracker=iou, groups={len(reference_groups)}, "
             f"references={len(reference_paths)}, prototypes={len(prototypes)}, "
             f"SAM-foreground={self.segmented_references}/{len(reference_paths)}"
         )
         self.yolo_model_source = resolve_yolo_model_source(yolo_model_id)
         self.yolo_runtime_source = self.yolo_model_source
         self.yolo_backend = "pytorch"
-        self.edgetam_model_source: str | None = None
         print(f"YOLOE weights: {self.yolo_model_source}")
         print(
             "Model input sizes: "
             f"YOLOE frames={self.yolo_imgsz}x{self.yolo_imgsz}, "
-            f"YOLOE references={self.yolo_reference_imgsz}x{self.yolo_reference_imgsz}, "
-            + (
-                f"EdgeTAM={self.edgetam_imgsz}x{self.edgetam_imgsz}"
-                if self.tracker_mode == "edgetam"
-                else "EdgeTAM=disabled"
-            )
+            f"YOLOE references={self.yolo_reference_imgsz}x{self.yolo_reference_imgsz}"
         )
         def initialize_visual_prompts(model: Any) -> None:
             mapping = encode_reference_prototypes(
@@ -995,50 +896,6 @@ class YoloEEdgeTamPipeline:
             self.yolo = YOLOE(self.yolo_model_source)
             initialize_visual_prompts(self.yolo)
 
-        self.processor: Any | None = None
-        self.edgetam: Any | None = None
-        if self.tracker_mode == "edgetam":
-            try:
-                from transformers import (
-                    EdgeTamVideoConfig,
-                    EdgeTamVideoModel,
-                    Sam2VideoProcessor,
-                )
-            except (ImportError, ModuleNotFoundError) as error:
-                raise RuntimeError(
-                    "EdgeTAM mode requires transformers>=4.57 and its dependencies"
-                ) from error
-            self.edgetam_model_source = materialize_edgetam_source(edgetam_model_id)
-            print(f"EdgeTAM weights: {self.edgetam_model_source}")
-            edgetam_config = EdgeTamVideoConfig.from_pretrained(
-                self.edgetam_model_source
-            )
-            configure_edgetam_resolution(edgetam_config, self.edgetam_imgsz)
-            self.processor = Sam2VideoProcessor.from_pretrained(
-                self.edgetam_model_source,
-                size={"height": self.edgetam_imgsz, "width": self.edgetam_imgsz},
-                mask_size={
-                    "height": self.edgetam_imgsz // 4,
-                    "width": self.edgetam_imgsz // 4,
-                },
-            )
-            self.edgetam = EdgeTamVideoModel.from_pretrained(
-                self.edgetam_model_source,
-                config=edgetam_config,
-                torch_dtype=self.dtype,
-            ).to(self.runtime.torch_device)
-            self.edgetam.eval()
-
-    def _new_session(self) -> Any:
-        return self.processor.init_video_session(
-            inference_device=self.runtime.torch_device,
-            inference_state_device=self.runtime.torch_device,
-            processing_device=self.runtime.torch_device,
-            video_storage_device="cpu",
-            max_vision_features_cache_size=1,
-            dtype=self.dtype,
-        )
-
     def _detect_objects(self, frame: np.ndarray) -> list[Detection]:
         results = self.yolo.predict(
             frame,
@@ -1048,7 +905,7 @@ class YoloEEdgeTamPipeline:
             agnostic_nms=True,
             device=self.runtime.yolo_device,
             max_det=self.max_objects,
-            retina_masks=self.tracker_mode == "iou",
+            retina_masks=True,
             verbose=False,
         )
         if not results or results[0].boxes is None:
@@ -1057,7 +914,7 @@ class YoloEEdgeTamPipeline:
         confidences = results[0].boxes.conf.detach().float().cpu().numpy()
         classes = results[0].boxes.cls.detach().int().cpu().numpy()
         mask_values: np.ndarray | None = None
-        if self.tracker_mode == "iou" and results[0].masks is not None:
+        if results[0].masks is not None:
             mask_values = results[0].masks.data.detach().float().cpu().numpy()
         order = _highest_confidence_non_overlapping(
             boxes,
@@ -1092,85 +949,8 @@ class YoloEEdgeTamPipeline:
         return detections
 
     def invalidate_tracking(self) -> None:
-        """Discard possibly inconsistent video memory after an inference failure."""
-        self.session = None
-        self.last_mask = None
-        self.last_objects = ()
-        self.object_metadata = {}
+        """Discard IoU state after an inference failure."""
         self.iou_tracks = {}
-        self.fallback_age = 0
-        self.frames_since_detection = self.redetect_interval
-
-    def _mask_from_output(
-        self,
-        output: Any,
-        original_sizes: Any,
-    ) -> tuple[np.ndarray, tuple[ObjectAnnotation, ...], int]:
-        masks = self.processor.post_process_masks(
-            [output.pred_masks],
-            original_sizes=original_sizes,
-            binarize=False,
-        )[0]
-        while masks.ndim > 3 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-
-        scores = getattr(output, "object_score_logits", None)
-        score_values: np.ndarray | None = None
-        if scores is not None:
-            score_values = scores.detach().float().sigmoid().cpu().reshape(-1).numpy()
-        mask_values = masks.detach().float().cpu().numpy()
-        if mask_values.ndim == 2:
-            mask_values = mask_values[None, ...]
-        if not len(mask_values):
-            height, width = (int(value) for value in original_sizes[0])
-            return np.zeros((height, width), dtype=bool), (), 0
-
-        object_ids = getattr(output, "object_ids", None)
-        if object_ids is None:
-            object_ids = getattr(self.session, "obj_ids", range(1, len(mask_values) + 1))
-        if hasattr(object_ids, "detach"):
-            object_ids = object_ids.detach().cpu().reshape(-1).tolist()
-        elif isinstance(object_ids, (int, np.integer)):
-            object_ids = [int(object_ids)]
-        else:
-            object_ids = list(object_ids)
-
-        instance_masks = mask_values > self.mask_threshold
-        valid_masks: list[np.ndarray] = []
-        annotations: list[ObjectAnnotation] = []
-        rejected_masks = 0
-        for index, mask in enumerate(instance_masks):
-            tracker_score = (
-                float(score_values[index])
-                if score_values is not None and index < len(score_values)
-                else None
-            )
-            if tracker_score is not None and tracker_score < self.edgetam_score_threshold:
-                continue
-            if int(np.count_nonzero(mask)) < self.min_mask_area:
-                continue
-            if float(np.count_nonzero(mask)) / float(mask.size) > self.max_mask_area_ratio:
-                rejected_masks += 1
-                continue
-            track_id = int(object_ids[index]) if index < len(object_ids) else index + 1
-            metadata = self.object_metadata.get(
-                track_id,
-                Detection((0.0, 0.0, 0.0, 0.0), 0.0, -1),
-            )
-            x, y, width, height = cv2.boundingRect(mask.astype(np.uint8))
-            valid_masks.append(mask)
-            annotations.append(
-                ObjectAnnotation(
-                    box=(x, y, x + width, y + height),
-                    track_id=track_id,
-                    reference_index=metadata.reference_index,
-                    detector_confidence=metadata.confidence,
-                    tracker_score=tracker_score,
-                )
-            )
-        if not valid_masks:
-            return np.zeros(instance_masks.shape[-2:], dtype=bool), (), rejected_masks
-        return np.logical_or.reduce(valid_masks), tuple(annotations), rejected_masks
 
     @staticmethod
     def _box_iou(
@@ -1275,116 +1055,14 @@ class YoloEEdgeTamPipeline:
         return FrameResult(
             mask=union_mask,
             yolo_ms=yolo_ms,
-            edgetam_ms=0.0,
             detections=len(valid_detections),
-            keyframe=True,
             used_fallback=used_fallback,
             objects=tuple(annotations),
             rejected_masks=rejected_masks,
-            tracker_kind="iou",
         )
 
     def process(self, frame: np.ndarray) -> FrameResult:
-        if self.tracker_mode == "iou":
-            return self._process_iou(frame)
-        return self._process_edgetam(frame)
-
-    def _process_edgetam(self, frame: np.ndarray) -> FrameResult:
-        keyframe = (
-            self.session is None
-            or self.frames_since_detection >= self.redetect_interval
-        )
-        yolo_ms = 0.0
-        detections = 0
-        reseeded = False
-        if keyframe:
-            started = perf_counter()
-            detected_objects = self._detect_objects(frame)
-            yolo_ms = (perf_counter() - started) * 1000.0
-            detections = len(detected_objects)
-            self.frames_since_detection = 0
-            if detections:
-                self.session = self._new_session()
-                self.object_metadata = {
-                    track_id: detection
-                    for track_id, detection in enumerate(detected_objects, start=1)
-                }
-                reseeded = True
-
-        if self.session is None:
-            empty = np.zeros(frame.shape[:2], dtype=bool)
-            self.last_mask = None
-            self.last_objects = ()
-            self.fallback_age = 0
-            self.frame_index += 1
-            return FrameResult(
-                empty,
-                yolo_ms,
-                0.0,
-                detections,
-                keyframe,
-                False,
-                (),
-            )
-
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        started = perf_counter()
-        inputs = self.processor(
-            images=rgb_frame,
-            device=self.runtime.torch_device,
-            return_tensors="pt",
-        ).to(self.runtime.torch_device)
-        if reseeded:
-            self.processor.add_inputs_to_inference_session(
-                inference_session=self.session,
-                frame_idx=0,
-                obj_ids=list(range(1, detections + 1)),
-                input_boxes=[[list(detection.box) for detection in detected_objects]],
-                original_size=tuple(int(value) for value in inputs.original_sizes[0]),
-            )
-        with self.torch.inference_mode():
-            output = self.edgetam(
-                inference_session=self.session,
-                frame=inputs.pixel_values[0].to(
-                    device=self.runtime.torch_device,
-                    dtype=self.dtype,
-                ),
-            )
-        mask, objects, rejected_masks = self._mask_from_output(
-            output,
-            inputs.original_sizes,
-        )
-        edgetam_ms = (perf_counter() - started) * 1000.0
-        used_fallback = False
-        if np.any(mask):
-            mask = _dilate_mask(mask, self.mask_dilation)
-            self.last_mask = mask
-            self.last_objects = objects
-            self.fallback_age = 0
-        elif self.last_mask is not None and self.fallback_age < self.fallback_frames:
-            mask = self.last_mask.copy()
-            objects = self.last_objects
-            self.fallback_age += 1
-            used_fallback = True
-        else:
-            self.last_mask = None
-            self.last_objects = ()
-            self.object_metadata = {}
-            self.fallback_age = 0
-            self.session = None
-
-        self.frames_since_detection += 1
-        self.frame_index += 1
-        return FrameResult(
-            mask,
-            yolo_ms,
-            edgetam_ms,
-            detections,
-            keyframe,
-            used_fallback,
-            objects,
-            rejected_masks,
-        )
+        return self._process_iou(frame)
 
 
 def _create_writer(
@@ -1426,40 +1104,32 @@ def process_image_prompt_stream(
     benchmark_path: Path | None,
     yolo_model_id: str,
     yolo_onnx: bool,
-    edgetam_model_id: str,
     device: str,
     precision: str,
     yolo_imgsz: int,
     yolo_reference_imgsz: int,
-    edgetam_imgsz: int,
     reference_size: int,
-    reference_sam: bool,
     reference_sam_model_id: str,
     reference_sam_points: int,
     reference_sam_min_area_ratio: float,
     reference_sam_max_area_ratio: float,
     yolo_confidence: float,
     yolo_iou: float,
-    edgetam_score_threshold: float,
-    mask_threshold: float,
     min_mask_area: int,
     max_mask_area_ratio: float,
     max_objects: int,
-    redetect_interval: int,
     mask_dilation: int,
-    fallback_frames: int,
     pixel_block_size: int,
     blur_kernel_size: int,
     redaction_mode: str,
     fail_closed: bool,
-    diagnostic_overlay: bool,
-    tracker_mode: str,
+    show_bboxes: bool,
+    show_statistics: bool,
     iou_threshold: float,
     iou_max_missed: int,
 ) -> dict[str, Any]:
     _validate_unit_interval("YOLO confidence", yolo_confidence)
     _validate_unit_interval("YOLO IoU", yolo_iou)
-    _validate_unit_interval("EdgeTAM score threshold", edgetam_score_threshold)
     _validate_unit_interval("IoU association threshold", iou_threshold)
     if not 0.0 < max_mask_area_ratio <= 1.0:
         raise ValueError("maximum mask area ratio must be greater than 0 and at most 1")
@@ -1469,7 +1139,7 @@ def process_image_prompt_stream(
         )
     if yolo_imgsz % 32 != 0 or yolo_reference_imgsz % 32 != 0:
         raise ValueError("YOLO input sizes must be divisible by 32")
-    if reference_sam and not reference_sam_model_id.strip():
+    if not reference_sam_model_id.strip():
         raise ValueError("Reference SAM model ID cannot be empty")
     if not 2 <= reference_sam_points <= 64:
         raise ValueError("Reference SAM points per side must be from 2 to 64")
@@ -1477,14 +1147,9 @@ def process_image_prompt_stream(
         raise ValueError(
             "Reference SAM area ratios must satisfy 0 < minimum < maximum <= 1"
         )
-    if edgetam_imgsz < 256 or edgetam_imgsz > 1024 or edgetam_imgsz % 64 != 0:
-        raise ValueError(
-            "EdgeTAM input size must be from 256 to 1024 and divisible by 64"
-        )
     if (
         min_mask_area < 0
         or mask_dilation < 0
-        or fallback_frames < 0
         or iou_max_missed < 0
     ):
         raise ValueError(
@@ -1492,7 +1157,6 @@ def process_image_prompt_stream(
         )
     if (
         max_objects <= 0
-        or redetect_interval <= 0
         or pixel_block_size <= 0
         or blur_kernel_size <= 1
     ):
@@ -1503,33 +1167,25 @@ def process_image_prompt_stream(
 
     reference_groups = resolve_reference_groups(reference_images)
     paths = [path for group in reference_groups for path in group]
-    pipeline = YoloEEdgeTamPipeline(
+    pipeline = YoloESamPipeline(
         reference_groups=reference_groups,
         yolo_model_id=yolo_model_id,
         yolo_onnx=yolo_onnx,
-        edgetam_model_id=edgetam_model_id,
         device=device,
         precision=precision,
         yolo_imgsz=yolo_imgsz,
         yolo_reference_imgsz=yolo_reference_imgsz,
-        edgetam_imgsz=edgetam_imgsz,
         reference_size=reference_size,
-        reference_sam=reference_sam,
         reference_sam_model_id=reference_sam_model_id,
         reference_sam_points=reference_sam_points,
         reference_sam_min_area_ratio=reference_sam_min_area_ratio,
         reference_sam_max_area_ratio=reference_sam_max_area_ratio,
         yolo_confidence=yolo_confidence,
         yolo_iou=yolo_iou,
-        edgetam_score_threshold=edgetam_score_threshold,
-        mask_threshold=mask_threshold,
         min_mask_area=min_mask_area,
         max_mask_area_ratio=max_mask_area_ratio,
         max_objects=max_objects,
-        redetect_interval=redetect_interval,
         mask_dilation=mask_dilation,
-        fallback_frames=fallback_frames,
-        tracker_mode=tracker_mode,
         iou_threshold=iou_threshold,
         iou_max_missed=iou_max_missed,
     )
@@ -1545,12 +1201,10 @@ def process_image_prompt_stream(
     final_path: Path | None = None
     virtual_sink: VirtualCameraSink | None = None
     frames = 0
-    keyframes = 0
     failures = 0
     fallback_count = 0
     rejected_mask_count = 0
     yolo_times: list[float] = []
-    edgetam_times: list[float] = []
     total_times: list[float] = []
     recent_frame_times: deque[float] = deque(maxlen=30)
     started_at = perf_counter()
@@ -1591,13 +1245,9 @@ def process_image_prompt_stream(
                     if redaction_mode == "blur"
                     else pixelate_mask(frame, result.mask, pixel_block_size)
                 )
-                keyframes += int(result.keyframe)
                 fallback_count += int(result.used_fallback)
                 rejected_mask_count += result.rejected_masks
-                if result.keyframe:
-                    yolo_times.append(result.yolo_ms)
-                if result.edgetam_ms:
-                    edgetam_times.append(result.edgetam_ms)
+                yolo_times.append(result.yolo_ms)
             except Exception as error:
                 failures += 1
                 frame_error = True
@@ -1614,7 +1264,7 @@ def process_image_prompt_stream(
             total_times.append(processing_ms)
             recent_frame_times.append(processing_ms)
             rolling_fps = 1000.0 / max(0.001, float(np.mean(recent_frame_times)))
-            if diagnostic_overlay:
+            if show_bboxes or show_statistics:
                 output = draw_diagnostics(
                     output,
                     result,
@@ -1622,6 +1272,9 @@ def process_image_prompt_stream(
                     processing_ms=processing_ms,
                     runtime=pipeline.runtime,
                     error=frame_error,
+                    show_bboxes=show_bboxes,
+                    show_statistics=show_statistics,
+                    mirror_statistics=not mirror,
                 )
             if virtual_sink is not None:
                 virtual_sink.submit(output)
@@ -1651,7 +1304,7 @@ def process_image_prompt_stream(
 
     elapsed = perf_counter() - started_at
     summary: dict[str, Any] = {
-        "mode": f"image-prompt-yoloe-{pipeline.tracker_mode}",
+        "mode": "image-prompt-sam-yoloe-iou",
         "source": str(video_path.resolve()) if video_path is not None else f"camera:{camera_index}",
         "output": str(final_path) if final_path is not None else None,
         "virtual_camera": virtual_camera,
@@ -1665,11 +1318,10 @@ def process_image_prompt_stream(
         "runtime": {
             "device": pipeline.runtime.torch_device,
             "precision": pipeline.runtime.precision,
-            "tracker": pipeline.tracker_mode,
+            "tracker": "iou",
             "yolo_model": pipeline.yolo_model_source,
             "yolo_runtime_model": pipeline.yolo_runtime_source,
             "yolo_backend": pipeline.yolo_backend,
-            "edgetam_model": pipeline.edgetam_model_source,
             "reference_sam_model": pipeline.reference_sam_model,
             "segmented_references": pipeline.segmented_references,
             "reference_prototypes": pipeline.reference_prototypes,
@@ -1678,29 +1330,24 @@ def process_image_prompt_stream(
                 "yoloe_frames": yolo_imgsz,
                 "yoloe_references": yolo_reference_imgsz,
                 "reference_maximum_side": reference_size,
-                "edgetam": edgetam_imgsz if pipeline.tracker_mode == "edgetam" else None,
             },
         },
         "thresholds": {
             "yolo_confidence": yolo_confidence,
             "yolo_iou": yolo_iou,
-            "edgetam_score": edgetam_score_threshold,
-            "mask_logit": mask_threshold,
             "minimum_mask_area": min_mask_area,
             "maximum_mask_area_ratio": max_mask_area_ratio,
             "iou_association": iou_threshold,
             "iou_max_missed": iou_max_missed,
         },
         "frames": frames,
-        "keyframes": keyframes,
         "fallback_frames": fallback_count,
         "rejected_large_masks": rejected_mask_count,
         "failures": failures,
         "elapsed_seconds": elapsed,
         "effective_fps": frames / elapsed if elapsed > 0 else 0.0,
         "latency_ms": {
-            "yolo_keyframes": _distribution(yolo_times),
-            "edgetam": _distribution(edgetam_times),
+            "yolo": _distribution(yolo_times),
             "total": _distribution(total_times),
         },
     }
