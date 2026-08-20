@@ -28,3 +28,4 @@ channels: 3
 end2end: true
 visual_prompt: DAVIS-2017-blackswan-reference
 visual_prompt_static: true
+visual_prompt_sha256: f658ce3f164ecb009a74543dda23b39d42c7c25de8b1da65b8577abeb02cf1db

@@ -258,17 +258,32 @@ privacy-enroll --help
 
 По умолчанию используется квантизованный OpenVINO INT8 export
 `models/yoloe/yoloe-26n-seg_int8_openvino_model`. Его visual prompt статически
-запечён из DAVIS `blackswan` reference. Поэтому этот дефолт предназначен для
-текущего сценария с лебедем: переданный `--reference-image` не может изменить
-prompt внутри уже экспортированной модели. Для произвольного нового объекта
-передайте исходную `yoloe-26n-seg.pt`; тогда SAM-маска кодируется в новый
-visual prompt при старте:
+запечён из DAVIS `blackswan` reference. Перед загрузкой pipeline вычисляет
+SHA-256 от фактических cropped reference, бинарных SAM-масок, группировки
+классов и размеров YOLOE. Если fingerprint совпал с `metadata.yaml`, готовая
+INT8-модель используется сразу. Если reference изменился, по умолчанию
+автоматически создаётся новая квантизованная модель в `.cache/yoloe/int8`.
+
+Для первого запуска с новым объектом нужны исходный checkpoint
+`models/yoloe/yoloe-26n-seg.pt` и calibration YAML. Стандартную DAVIS
+calibration-выборку можно подготовить так:
+
+```powershell
+python benchmarks/prepare_davis_int8_calibration.py `
+  --output outputs/int8_calibration_davis_train
+```
+
+Первый запуск нового reference занимает около 2–3 минут на проверенном CPU;
+следующие запуски используют content-addressed INT8 cache без повторной
+квантизации:
 
 ```powershell
 privacy-recognize --image-prompt-video `
-  --reference-image data/references/object.jpg `
-  --image-yolo-model models/yoloe/yoloe-26n-seg.pt
+  --reference-image data/references/object.jpg
 ```
+
+Для немедленного FP32-запуска без INT8 export явно передайте исходную `.pt`
+модель: `--image-yolo-model models/yoloe/yoloe-26n-seg.pt`.
 
 ```powershell
 privacy-recognize --image-prompt-video `
@@ -306,6 +321,10 @@ privacy-recognize --image-prompt-video `
 | Флаг | По умолчанию | Назначение |
 |---|---:|---|
 | `--image-yolo-model` | `models/yoloe/yoloe-26n-seg_int8_openvino_model` | Статический OpenVINO INT8 visual prompt для `blackswan`. |
+| `--image-yolo-auto-quantize` | on | Сравнить SHA-256 reference и автоматически создать INT8 при несовпадении. |
+| `--image-yolo-source-model` | `models/yoloe/yoloe-26n-seg.pt` | Исходные FP32-веса для нового export. |
+| `--image-int8-calibration-data` | `outputs/int8_calibration_davis_train/davis_train_calibration.yaml` | Репрезентативная calibration-выборка. |
+| `--image-yolo-int8-cache-dir` | `.cache/yoloe/int8` | Кеш INT8-моделей, адресованный SHA-256 содержимого. |
 | `--image-reference-sam-model` | `facebook/sam2.1-hiera-tiny` | SAM для reference foreground. |
 | `--image-yolo-imgsz` | `640` | YOLOE input для кадров. |
 | `--image-yolo-reference-imgsz` | `640` | YOLOE input для references. |

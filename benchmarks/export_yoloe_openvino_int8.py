@@ -19,7 +19,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    from privacy_filter.image_prompt_video import YoloESamPipeline
+    from privacy_filter.image_prompt_video import (
+        YoloESamPipeline,
+        _append_openvino_reference_fingerprint,
+        _openvino_reference_fingerprint,
+    )
 
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -80,12 +84,17 @@ def main() -> None:
         )
     ).resolve()
     int8_export_ms = (perf_counter() - int8_started) * 1000.0
+    if _openvino_reference_fingerprint(int8_path) is None:
+        _append_openvino_reference_fingerprint(
+            int8_path, pipeline.reference_prompt_sha256
+        )
 
     result = {
         "weights": str(args.weights.resolve()),
         "reference": str(args.reference.resolve()),
         "calibration_data": str(args.calibration_data.resolve()),
         "imgsz": args.imgsz,
+        "visual_prompt_sha256": pipeline.reference_prompt_sha256,
         "setup_ms": setup_ms,
         "fp32": {"path": str(fp32_path), "export_ms": fp32_export_ms},
         "int8": {"path": str(int8_path), "export_ms": int8_export_ms},

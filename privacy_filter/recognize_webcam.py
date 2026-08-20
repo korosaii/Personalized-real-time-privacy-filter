@@ -254,6 +254,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     image_prompt.add_argument(
+        "--image-yolo-auto-quantize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compare SHA-256 visual-prompt fingerprints and create a cached INT8 "
+            "OpenVINO export when the reference does not match"
+        ),
+    )
+    image_prompt.add_argument(
+        "--image-yolo-source-model",
+        default="models/yoloe/yoloe-26n-seg.pt",
+        help="Original YOLOE .pt checkpoint used for automatic INT8 export",
+    )
+    image_prompt.add_argument(
+        "--image-int8-calibration-data",
+        type=Path,
+        default=Path(
+            "outputs/int8_calibration_davis_train/davis_train_calibration.yaml"
+        ),
+        help="Ultralytics dataset YAML with representative INT8 calibration images",
+    )
+    image_prompt.add_argument(
+        "--image-yolo-int8-cache-dir",
+        type=Path,
+        default=Path(".cache/yoloe/int8"),
+        help="Content-addressed cache for reference-specific OpenVINO INT8 models",
+    )
+    image_prompt.add_argument(
         "--image-yolo-onnx",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1549,6 +1577,10 @@ def main() -> None:
                 reference_sam_mask_output_directory=args.image_sam_mask_output_dir,
                 yolo_model_id=args.image_yolo_model,
                 yolo_onnx=args.image_yolo_onnx,
+                yolo_auto_quantize=args.image_yolo_auto_quantize,
+                yolo_source_model_id=args.image_yolo_source_model,
+                yolo_int8_calibration_data=args.image_int8_calibration_data,
+                yolo_int8_cache_directory=args.image_yolo_int8_cache_dir,
                 device=args.image_device,
                 precision=args.image_precision,
                 yolo_imgsz=args.image_yolo_imgsz,

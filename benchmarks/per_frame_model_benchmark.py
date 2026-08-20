@@ -135,6 +135,10 @@ def build_yoloe_visual(args: argparse.Namespace) -> tuple[Callable[[np.ndarray],
         mask_dilation=5,
         iou_threshold=0.30,
         iou_max_missed=0,
+        yolo_auto_quantize=args.auto_quantize,
+        yolo_source_model_id=str(args.source_model),
+        yolo_int8_calibration_data=args.calibration_data,
+        yolo_int8_cache_directory=args.int8_cache_dir,
     )
     provider = "pytorch"
     if args.onnx:
@@ -625,6 +629,18 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=10)
     parser.add_argument("--object-id", type=int, default=1)
     parser.add_argument("--onnx", action="store_true")
+    parser.add_argument("--auto-quantize", action="store_true")
+    parser.add_argument(
+        "--source-model",
+        type=Path,
+        default=PROJECT_ROOT / "models" / "yoloe" / "yoloe-26n-seg.pt",
+    )
+    parser.add_argument("--calibration-data", type=Path)
+    parser.add_argument(
+        "--int8-cache-dir",
+        type=Path,
+        default=PROJECT_ROOT / ".cache" / "yoloe" / "int8",
+    )
     parser.add_argument(
         "--onnx-provider", choices=("cpu", "dml"), default="cpu"
     )

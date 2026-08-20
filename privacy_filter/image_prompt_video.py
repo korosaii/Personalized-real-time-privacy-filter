@@ -407,7 +407,41 @@ def _fixed_prompt_onnx_path(
 ) -> Path:
     """Return a content-addressed cache path for a fixed-prompt FP32 export."""
     digest = hashlib.sha256()
-    digest.update(b"yoloe-fixed-visual-prompts-exact-mask-per-reference-v2")
+    digest.update(
+        _reference_prompt_fingerprint(
+            prototypes,
+            yolo_imgsz=yolo_imgsz,
+            yolo_reference_imgsz=yolo_reference_imgsz,
+        ).encode()
+    )
+    model_path = Path(model_source)
+    if model_path.is_file():
+        digest.update(_sha256_file(model_path).encode())
+    else:
+        digest.update(model_source.encode())
+    cache_directory = MODELS_ROOT / "yoloe" / "onnx"
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    model_stem = model_path.stem or "yoloe"
+    return cache_directory / f"{model_stem}-{digest.hexdigest()[:16]}-fp32.onnx"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _reference_prompt_fingerprint(
+    prototypes: Iterable[ReferencePrototype],
+    *,
+    yolo_imgsz: int,
+    yolo_reference_imgsz: int,
+) -> str:
+    """Hash the exact visual-prompt inputs and their class grouping."""
+    digest = hashlib.sha256()
+    digest.update(b"yoloe-fixed-visual-prompts-exact-mask-per-reference-v3")
     digest.update(str(yolo_imgsz).encode())
     digest.update(str(yolo_reference_imgsz).encode())
     for prototype in prototypes:
@@ -416,17 +450,36 @@ def _fixed_prompt_onnx_path(
         digest.update(np.asarray(prototype.mask.shape, dtype=np.int32).tobytes())
         digest.update(np.packbits(prototype.mask).tobytes())
         digest.update(str(prototype.object_index).encode())
-    model_path = Path(model_source)
-    if model_path.is_file():
-        with model_path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    else:
-        digest.update(model_source.encode())
-    cache_directory = MODELS_ROOT / "yoloe" / "onnx"
-    cache_directory.mkdir(parents=True, exist_ok=True)
-    model_stem = model_path.stem or "yoloe"
-    return cache_directory / f"{model_stem}-{digest.hexdigest()[:16]}-fp32.onnx"
+    return digest.hexdigest()
+
+
+def _openvino_reference_fingerprint(model_directory: Path) -> str | None:
+    metadata_path = model_directory / "metadata.yaml"
+    if not metadata_path.is_file():
+        return None
+    for line in metadata_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "visual_prompt_sha256":
+            candidate = value.strip().strip("'\"").lower()
+            if len(candidate) == 64 and all(
+                character in "0123456789abcdef" for character in candidate
+            ):
+                return candidate
+            return None
+    return None
+
+
+def _append_openvino_reference_fingerprint(
+    model_directory: Path,
+    fingerprint: str,
+) -> None:
+    metadata_path = model_directory / "metadata.yaml"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"OpenVINO metadata not found: {metadata_path}")
+    if _openvino_reference_fingerprint(model_directory) is not None:
+        raise RuntimeError(f"OpenVINO metadata already has a fingerprint: {metadata_path}")
+    with metadata_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"visual_prompt_sha256: {fingerprint}\n")
 
 
 def encode_reference_prototypes(
@@ -559,6 +612,82 @@ def encode_reference_prototypes(
         combined,
     )
     return tuple(prototype_to_object)
+
+
+def _export_fixed_prompt_openvino_int8(
+    *,
+    yoloe_type: type,
+    initialize_visual_prompts: Callable[[Any], None],
+    source_model: Path,
+    calibration_data: Path,
+    cache_root: Path,
+    reference_fingerprint: str,
+    imgsz: int,
+    device: str | int,
+    torch_module: Any,
+) -> Path:
+    if not source_model.is_file():
+        raise FileNotFoundError(
+            "Automatic INT8 export requires the original YOLOE checkpoint: "
+            f"{source_model}"
+        )
+    if not calibration_data.is_file():
+        raise FileNotFoundError(
+            "Automatic INT8 export requires a calibration dataset YAML: "
+            f"{calibration_data}"
+        )
+    artifact_digest = hashlib.sha256()
+    artifact_digest.update(reference_fingerprint.encode())
+    artifact_digest.update(_sha256_file(source_model).encode())
+    artifact_digest.update(_sha256_file(calibration_data).encode())
+    artifact_key = artifact_digest.hexdigest()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    target = cache_root / (
+        f"{source_model.stem}-{artifact_key[:20]}_int8_openvino_model"
+    )
+    if target.is_dir():
+        if _openvino_reference_fingerprint(target) == reference_fingerprint:
+            print(f"Using cached fixed-prompt YOLOE INT8: {target}")
+            return target
+        raise RuntimeError(
+            "The content-addressed INT8 cache entry is invalid; remove it and retry: "
+            f"{target}"
+        )
+
+    print(
+        "Reference fingerprint does not match the configured OpenVINO model; "
+        f"exporting a new INT8 cache entry: {reference_fingerprint}"
+    )
+    with TemporaryDirectory(
+        prefix=f".{artifact_key[:12]}-",
+        dir=cache_root,
+    ) as temporary_directory_name:
+        temporary_directory = Path(temporary_directory_name).resolve()
+        staged_checkpoint = temporary_directory / source_model.name
+        shutil.copy2(source_model, staged_checkpoint)
+        export_model = yoloe_type(str(staged_checkpoint))
+        initialize_visual_prompts(export_model)
+        exported = Path(
+            export_model.export(
+                format="openvino",
+                imgsz=imgsz,
+                batch=1,
+                dynamic=False,
+                quantize=8,
+                data=str(calibration_data),
+                fraction=1.0,
+                device=device,
+            )
+        ).resolve()
+        if not exported.is_dir() or not exported.is_relative_to(temporary_directory):
+            raise RuntimeError(f"Unexpected YOLOE OpenVINO export path: {exported}")
+        _append_openvino_reference_fingerprint(exported, reference_fingerprint)
+        shutil.move(str(exported), str(target))
+        del export_model
+        if str(device).startswith("cuda") or device == 0:
+            torch_module.cuda.empty_cache()
+    print(f"Saved fixed-prompt YOLOE INT8 cache: {target}")
+    return target
 
 
 def select_runtime(torch_module: Any, device: str, precision: str) -> RuntimeSelection:
@@ -798,6 +927,10 @@ class YoloESamPipeline:
         mask_dilation: int,
         iou_threshold: float,
         iou_max_missed: int,
+        yolo_auto_quantize: bool = False,
+        yolo_source_model_id: str = "models/yoloe/yoloe-26n-seg.pt",
+        yolo_int8_calibration_data: Path | None = None,
+        yolo_int8_cache_directory: Path | None = None,
     ) -> None:
         try:
             import torch
@@ -844,6 +977,11 @@ class YoloESamPipeline:
         )
         self.prototype_to_reference = tuple(
             prototype.object_index for prototype in prototypes
+        )
+        self.reference_prompt_sha256 = _reference_prompt_fingerprint(
+            prototypes,
+            yolo_imgsz=yolo_imgsz,
+            yolo_reference_imgsz=yolo_reference_imgsz,
         )
         self.reference_prototypes = len(prototypes)
         self.reference_sam_model = reference_sam_model_id
@@ -897,12 +1035,49 @@ class YoloESamPipeline:
                     "A fixed-prompt OpenVINO model directory cannot be combined "
                     "with FP32 ONNX export"
                 )
+            embedded_fingerprint = _openvino_reference_fingerprint(source_path)
+            if embedded_fingerprint != self.reference_prompt_sha256:
+                if not yolo_auto_quantize:
+                    raise ValueError(
+                        "The reference fingerprint does not match the fixed-prompt "
+                        f"OpenVINO model (expected {self.reference_prompt_sha256}, "
+                        f"found {embedded_fingerprint or 'none'}). Enable automatic "
+                        "INT8 quantization or select a matching model."
+                    )
+                source_model = Path(
+                    resolve_yolo_model_source(yolo_source_model_id)
+                )
+                if yolo_int8_calibration_data is None:
+                    raise ValueError(
+                        "Automatic INT8 quantization requires calibration data"
+                    )
+                calibration_data = yolo_int8_calibration_data.expanduser()
+                if not calibration_data.is_absolute():
+                    calibration_data = PROJECT_ROOT / calibration_data
+                cache_root = (
+                    yolo_int8_cache_directory.expanduser()
+                    if yolo_int8_cache_directory is not None
+                    else PROJECT_ROOT / ".cache" / "yoloe" / "int8"
+                )
+                if not cache_root.is_absolute():
+                    cache_root = PROJECT_ROOT / cache_root
+                source_path = _export_fixed_prompt_openvino_int8(
+                    yoloe_type=YOLOE,
+                    initialize_visual_prompts=initialize_visual_prompts,
+                    source_model=source_model.resolve(),
+                    calibration_data=calibration_data.resolve(),
+                    cache_root=cache_root.resolve(),
+                    reference_fingerprint=self.reference_prompt_sha256,
+                    imgsz=self.yolo_imgsz,
+                    device=self.runtime.yolo_device,
+                    torch_module=torch,
+                )
             self.yolo = YOLO(str(source_path), task="segment")
             self.yolo_runtime_source = str(source_path)
             self.yolo_backend = "openvino-fixed-prompt"
             print(
-                "Using fixed-prompt OpenVINO YOLOE. The visual prompt is baked "
-                "into this export; re-export after changing reference images."
+                "Using fingerprint-matched fixed-prompt OpenVINO YOLOE: "
+                f"{self.reference_prompt_sha256}"
             )
         elif yolo_onnx:
             if not source_path.is_file():
@@ -1163,6 +1338,10 @@ def process_image_prompt_stream(
     reference_sam_mask_output_directory: Path | None,
     yolo_model_id: str,
     yolo_onnx: bool,
+    yolo_auto_quantize: bool,
+    yolo_source_model_id: str,
+    yolo_int8_calibration_data: Path | None,
+    yolo_int8_cache_directory: Path | None,
     device: str,
     precision: str,
     yolo_imgsz: int,
@@ -1230,6 +1409,10 @@ def process_image_prompt_stream(
         reference_groups=reference_groups,
         yolo_model_id=yolo_model_id,
         yolo_onnx=yolo_onnx,
+        yolo_auto_quantize=yolo_auto_quantize,
+        yolo_source_model_id=yolo_source_model_id,
+        yolo_int8_calibration_data=yolo_int8_calibration_data,
+        yolo_int8_cache_directory=yolo_int8_cache_directory,
         device=device,
         precision=precision,
         yolo_imgsz=yolo_imgsz,
@@ -1391,6 +1574,7 @@ def process_image_prompt_stream(
             "reference_sam_model": pipeline.reference_sam_model,
             "segmented_references": pipeline.segmented_references,
             "reference_prototypes": pipeline.reference_prototypes,
+            "reference_prompt_sha256": pipeline.reference_prompt_sha256,
             "reference_prompt_policy": "exact_mask_per_photo_max_over_prototypes",
             "input_sizes": {
                 "yoloe_frames": yolo_imgsz,
