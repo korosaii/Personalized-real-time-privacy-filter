@@ -55,6 +55,7 @@ python -m pip install -e .
 | Виртуальная камера | `python -m pip install -e ".[virtual-camera]"` |
 | Offline text-prompt | `python -m pip install -e ".[grounded-video]"` |
 | Realtime image-prompt | `python -m pip install -e ".[image-prompt]"` |
+| Экспорт OpenVINO INT8 | `python -m pip install -e ".[image-prompt,quantization]"` |
 
 Разрешите Terminal или IDE доступ к камере в настройках операционной системы.
 
@@ -70,7 +71,11 @@ models/
 ├── recognition/
 │   └── webface_r50.onnx
 └── yoloe/
-    └── yoloe-26n-seg.pt
+    ├── yoloe-26n-seg.pt
+    └── yoloe-26n-seg_int8_openvino_model/
+        ├── metadata.yaml
+        ├── yoloe-26n-seg.bin
+        └── yoloe-26n-seg.xml
 ```
 
 Несмотря на имя файла detector-весов, это основная дообученная модель проекта,
@@ -248,15 +253,34 @@ privacy-enroll --help
 ## Realtime image-prompt: SAM + YOLOE
 
 Этот режим скрывает объекты, похожие на reference-изображения. SAM 2 один раз
-выделяет foreground на каждом reference, после чего YOLOE формирует visual
-prompts и сегментирует кадры. EdgeTAM не используется. YOLOE запускается на
-каждом кадре, а временные ID связываются лёгким bbox IoU association.
+выделяет foreground на каждом reference. YOLOE запускается на каждом кадре, а
+временные ID связываются лёгким bbox IoU association. EdgeTAM не используется.
+
+По умолчанию используется квантизованный OpenVINO INT8 export
+`models/yoloe/yoloe-26n-seg_int8_openvino_model`. Его visual prompt статически
+запечён из DAVIS `blackswan` reference. Поэтому этот дефолт предназначен для
+текущего сценария с лебедем: переданный `--reference-image` не может изменить
+prompt внутри уже экспортированной модели. Для произвольного нового объекта
+передайте исходную `yoloe-26n-seg.pt`; тогда SAM-маска кодируется в новый
+visual prompt при старте:
 
 ```powershell
 privacy-recognize --image-prompt-video `
   --reference-image data/references/object.jpg `
-  --image-redaction blur
+  --image-yolo-model models/yoloe/yoloe-26n-seg.pt
 ```
+
+```powershell
+privacy-recognize --image-prompt-video `
+  --reference-image data/references/object.jpg `
+  --image-redaction blur `
+  --image-sam-mask-output-dir outputs/reference-sam-masks
+```
+
+При `--image-sam-mask-output-dir` foreground-маска, которую SAM 2 строит для
+каждого reference-изображения, сохраняется как чёрно-белый PNG
+(`000_object.png`, ...): белым отмечен выбранный объект, чёрным — фон. Это та
+самая маска, которая затем передаётся в YOLOE как visual prompt.
 
 Каталог считается одним классом с несколькими ракурсами:
 
@@ -281,7 +305,7 @@ privacy-recognize --image-prompt-video `
 
 | Флаг | По умолчанию | Назначение |
 |---|---:|---|
-| `--image-yolo-model` | `models/yoloe/yoloe-26n-seg.pt` | YOLOE weights. |
+| `--image-yolo-model` | `models/yoloe/yoloe-26n-seg_int8_openvino_model` | Статический OpenVINO INT8 visual prompt для `blackswan`. |
 | `--image-reference-sam-model` | `facebook/sam2.1-hiera-tiny` | SAM для reference foreground. |
 | `--image-yolo-imgsz` | `640` | YOLOE input для кадров. |
 | `--image-yolo-reference-imgsz` | `640` | YOLOE input для references. |
@@ -290,7 +314,29 @@ privacy-recognize --image-prompt-video `
 | `--image-iou-max-missed` | `1` | Допустимые пропуски track. |
 | `--image-redaction` | `blur` | `blur` или `pixelate`. |
 | `--image-blur-kernel-size` | `51` | Размер Gaussian blur kernel. |
+| `--image-sam-mask-output-dir` | off | Каталог с PNG-масками SAM для references. |
 | `--no-bboxes --no-statistics` | off | Оставить только redaction. |
+
+### Метрики OpenVINO INT8
+
+Бенчмарк выполнен на всех 50 кадрах DAVIS 2017 `blackswan`, 854x480, при
+YOLOE input 640x640. Калибровка использовала 600 кадров из 60
+последовательностей DAVIS train; `blackswan` в калибровку не входил.
+
+| Runtime | FPS | Mean latency | p95 | J/IoU | F | J&F | Recall | Утечка | Лишний фон |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PyTorch FP32 | 10.42 | 95.98 ms | 126.04 ms | 0.8045 | 0.8795 | 0.8420 | 93.16% | 6.84% | 1.71% |
+| OpenVINO FP32 | 5.27 | 189.68 ms | 302.25 ms | 0.8207 | 0.8977 | 0.8592 | 95.49% | 4.51% | 1.79% |
+| **OpenVINO INT8** | **13.29** | **75.22 ms** | **109.35 ms** | **0.8124** | **0.8988** | **0.8556** | **94.40%** | **5.60%** | **1.77%** |
+
+INT8 быстрее текущего PyTorch FP32 на 27.6% по FPS, а размер OpenVINO
+артефакта уменьшен с 10.83 до 3.61 MiB. При этом на худшем кадре 31 утечка
+достигла 49.74%, поэтому перед применением к другому реальному сценарию нужно
+проверять не только средние метрики, но и покадровый worst case.
+
+Повторяемый экспорт выполняют скрипты
+`benchmarks/prepare_davis_int8_calibration.py` и
+`benchmarks/export_yoloe_openvino_int8.py`.
 
 ## Offline text-prompt: Grounding DINO + SAM 2.1
 

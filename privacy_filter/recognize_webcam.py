@@ -228,6 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="configs/sam2.1/sam2.1_hiera_s.yaml",
     )
     parser.add_argument("--video-pixel-block-size", type=int, default=16)
+    parser.add_argument(
+        "--offline-mask-output-dir",
+        type=Path,
+        default=None,
+        help="Save Grounded SAM 2 union masks as numbered black-and-white PNGs",
+    )
     image_prompt = parser.add_argument_group("SAM + YOLOE image-prompt mode")
     image_prompt.add_argument(
         "--reference-image",
@@ -241,7 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_prompt.add_argument(
         "--image-yolo-model",
-        default="models/yoloe/yoloe-26n-seg.pt",
+        default="models/yoloe/yoloe-26n-seg_int8_openvino_model",
+        help=(
+            "YOLOE weights or fixed-prompt OpenVINO model directory; the default "
+            "INT8 export contains the DAVIS blackswan visual prompt"
+        ),
     )
     image_prompt.add_argument(
         "--image-yolo-onnx",
@@ -343,6 +353,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Expand the final mask by this many pixels to cover boundaries",
+    )
+    image_prompt.add_argument(
+        "--image-sam-mask-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Save the one-shot SAM foreground mask for each reference image as a "
+            "black-and-white PNG in this directory"
+        ),
     )
     image_prompt.add_argument("--image-pixel-block-size", type=int, default=16)
     image_prompt.add_argument(
@@ -1488,6 +1507,7 @@ def main() -> None:
                 device=args.offline_device,
                 pixel_block_size=args.video_pixel_block_size,
                 output_size=args.video_output_size,
+                mask_output_directory=args.offline_mask_output_dir,
             )
             return
         if args.image_prompt_video:
@@ -1526,6 +1546,7 @@ def main() -> None:
                 virtual_camera=args.virtual_camera,
                 max_frames=args.max_frames,
                 benchmark_path=Path(args.benchmark_out) if args.benchmark_out else None,
+                reference_sam_mask_output_directory=args.image_sam_mask_output_dir,
                 yolo_model_id=args.image_yolo_model,
                 yolo_onnx=args.image_yolo_onnx,
                 device=args.image_device,

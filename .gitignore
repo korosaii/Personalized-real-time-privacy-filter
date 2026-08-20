@@ -34,5 +34,6 @@ data/references/**
 data/P1E/
 data/P1E_S1/
 data/groundtruth/
+data/DAVIS/
 
 *.mp4

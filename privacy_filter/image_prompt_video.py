@@ -24,7 +24,9 @@ WINDOW_TITLE = "YOLOE image-prompt privacy filter (Q/Esc to quit)"
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_ROOT = PROJECT_ROOT / "models"
-DEFAULT_YOLOE_PATH = MODELS_ROOT / "yoloe" / "yoloe-26n-seg.pt"
+DEFAULT_YOLOE_PATH = (
+    MODELS_ROOT / "yoloe" / "yoloe-26n-seg_int8_openvino_model"
+)
 
 
 @dataclass(frozen=True)
@@ -310,6 +312,7 @@ def extract_reference_masks_with_sam(
     points_per_side: int,
     minimum_area_ratio: float,
     maximum_area_ratio: float,
+    mask_output_directory: Path | None = None,
 ) -> dict[Path, np.ndarray]:
     """Run a small SAM 2 model once, then release it before realtime inference."""
     try:
@@ -346,9 +349,17 @@ def extract_reference_masks_with_sam(
         else nullcontext()
     )
     masks: dict[Path, np.ndarray] = {}
+    resolved_mask_directory = (
+        mask_output_directory.expanduser().resolve()
+        if mask_output_directory is not None
+        else None
+    )
+    if resolved_mask_directory is not None:
+        resolved_mask_directory.mkdir(parents=True, exist_ok=True)
+        print(f"Reference SAM masks: {resolved_mask_directory}")
     try:
         with torch_module.inference_mode(), autocast:
-            for path in reference_paths:
+            for reference_index, path in enumerate(reference_paths):
                 image = cv2.imread(str(path), cv2.IMREAD_COLOR)
                 if image is None or image.size == 0:
                     raise ValueError(f"Could not decode reference image: {path}")
@@ -367,10 +378,18 @@ def extract_reference_masks_with_sam(
                     )
                     continue
                 masks[path] = selected.mask
+                saved_path: Path | None = None
+                if resolved_mask_directory is not None:
+                    saved_path = (
+                        resolved_mask_directory
+                        / f"{reference_index:03d}_{path.stem}.png"
+                    )
+                    save_mask_image(selected.mask, saved_path)
                 print(
                     f"Reference SAM: {path.name} foreground={selected.area_ratio:.1%}, "
                     f"IoU={selected.predicted_iou:.3f}, "
                     f"stability={selected.stability_score:.3f}"
+                    + (f", mask={saved_path}" if saved_path is not None else "")
                 )
     finally:
         del generator, sam_model
@@ -611,6 +630,17 @@ def _dilate_mask(mask: np.ndarray, pixels: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
+def save_mask_image(mask: np.ndarray, output_path: Path) -> None:
+    """Save a full-frame boolean segmentation mask as a viewable PNG image."""
+    values = np.asarray(mask)
+    if values.ndim != 2:
+        raise ValueError(f"Expected a 2D mask, got shape {values.shape}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image = values.astype(bool).astype(np.uint8) * 255
+    if not cv2.imwrite(str(output_path), image):
+        raise RuntimeError(f"Could not write segmentation mask: {output_path}")
+
+
 def _distribution(values: list[float]) -> dict[str, float] | None:
     if not values:
         return None
@@ -759,6 +789,7 @@ class YoloESamPipeline:
         reference_sam_points: int,
         reference_sam_min_area_ratio: float,
         reference_sam_max_area_ratio: float,
+        reference_sam_mask_output_directory: Path | None,
         yolo_confidence: float,
         yolo_iou: float,
         min_mask_area: int,
@@ -804,6 +835,7 @@ class YoloESamPipeline:
             points_per_side=reference_sam_points,
             minimum_area_ratio=reference_sam_min_area_ratio,
             maximum_area_ratio=reference_sam_max_area_ratio,
+            mask_output_directory=reference_sam_mask_output_directory,
         )
         prototypes = build_reference_prototypes(
             reference_groups,
@@ -816,6 +848,16 @@ class YoloESamPipeline:
         self.reference_prototypes = len(prototypes)
         self.reference_sam_model = reference_sam_model_id
         self.segmented_references = len(reference_masks or ())
+        self.reference_sam_mask_output_directory = (
+            reference_sam_mask_output_directory.expanduser().resolve()
+            if reference_sam_mask_output_directory is not None
+            else None
+        )
+        self.saved_reference_sam_masks = (
+            len(reference_masks)
+            if self.reference_sam_mask_output_directory is not None
+            else 0
+        )
 
         print(
             "Image-prompt runtime: "
@@ -845,8 +887,24 @@ class YoloESamPipeline:
             if mapping != self.prototype_to_reference:
                 raise RuntimeError("Reference prototype mapping changed during encoding")
 
-        if yolo_onnx:
-            source_path = Path(self.yolo_model_source)
+        source_path = Path(self.yolo_model_source)
+        openvino_ir_files = (
+            list(source_path.glob("*.xml")) if source_path.is_dir() else []
+        )
+        if source_path.is_dir() and len(openvino_ir_files) == 1:
+            if yolo_onnx:
+                raise ValueError(
+                    "A fixed-prompt OpenVINO model directory cannot be combined "
+                    "with FP32 ONNX export"
+                )
+            self.yolo = YOLO(str(source_path), task="segment")
+            self.yolo_runtime_source = str(source_path)
+            self.yolo_backend = "openvino-fixed-prompt"
+            print(
+                "Using fixed-prompt OpenVINO YOLOE. The visual prompt is baked "
+                "into this export; re-export after changing reference images."
+            )
+        elif yolo_onnx:
             if not source_path.is_file():
                 raise ValueError("FP32 ONNX export requires a local YOLOE .pt file")
             onnx_path = _fixed_prompt_onnx_path(
@@ -1102,6 +1160,7 @@ def process_image_prompt_stream(
     virtual_camera: bool,
     max_frames: int,
     benchmark_path: Path | None,
+    reference_sam_mask_output_directory: Path | None,
     yolo_model_id: str,
     yolo_onnx: bool,
     device: str,
@@ -1180,6 +1239,7 @@ def process_image_prompt_stream(
         reference_sam_points=reference_sam_points,
         reference_sam_min_area_ratio=reference_sam_min_area_ratio,
         reference_sam_max_area_ratio=reference_sam_max_area_ratio,
+        reference_sam_mask_output_directory=reference_sam_mask_output_directory,
         yolo_confidence=yolo_confidence,
         yolo_iou=yolo_iou,
         min_mask_area=min_mask_area,
@@ -1307,6 +1367,12 @@ def process_image_prompt_stream(
         "mode": "image-prompt-sam-yoloe-iou",
         "source": str(video_path.resolve()) if video_path is not None else f"camera:{camera_index}",
         "output": str(final_path) if final_path is not None else None,
+        "reference_sam_mask_output_directory": (
+            str(pipeline.reference_sam_mask_output_directory)
+            if pipeline.reference_sam_mask_output_directory is not None
+            else None
+        ),
+        "saved_reference_sam_masks": pipeline.saved_reference_sam_masks,
         "virtual_camera": virtual_camera,
         "virtual_camera_device": (
             virtual_sink.device if virtual_sink is not None else None
