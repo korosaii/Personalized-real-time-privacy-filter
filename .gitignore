@@ -15,6 +15,7 @@ models/**/*.onnx
 models/**/*.pth
 models/**/*.pt
 models/edgetam/
+models/yoloe/*_openvino_model/
 
 benchmarks/*.json
 benchmarks/*.csv

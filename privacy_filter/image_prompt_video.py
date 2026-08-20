@@ -25,7 +25,7 @@ IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_ROOT = PROJECT_ROOT / "models"
 DEFAULT_YOLOE_PATH = (
-    MODELS_ROOT / "yoloe" / "yoloe-26n-seg_int8_openvino_model"
+    MODELS_ROOT / "yoloe" / "yoloe-26n-seg.pt"
 )
 
 
@@ -1025,7 +1025,45 @@ class YoloESamPipeline:
             if mapping != self.prototype_to_reference:
                 raise RuntimeError("Reference prototype mapping changed during encoding")
 
+        def automatic_int8_path(source_model: Path) -> Path:
+            if yolo_onnx:
+                raise ValueError(
+                    "Automatic OpenVINO INT8 quantization cannot be combined "
+                    "with FP32 ONNX export"
+                )
+            if yolo_int8_calibration_data is None:
+                raise ValueError(
+                    "Automatic INT8 quantization requires calibration data"
+                )
+            calibration_data = yolo_int8_calibration_data.expanduser()
+            if not calibration_data.is_absolute():
+                calibration_data = PROJECT_ROOT / calibration_data
+            cache_root = (
+                yolo_int8_cache_directory.expanduser()
+                if yolo_int8_cache_directory is not None
+                else PROJECT_ROOT / ".cache" / "yoloe" / "int8"
+            )
+            if not cache_root.is_absolute():
+                cache_root = PROJECT_ROOT / cache_root
+            return _export_fixed_prompt_openvino_int8(
+                yoloe_type=YOLOE,
+                initialize_visual_prompts=initialize_visual_prompts,
+                source_model=source_model.resolve(),
+                calibration_data=calibration_data.resolve(),
+                cache_root=cache_root.resolve(),
+                reference_fingerprint=self.reference_prompt_sha256,
+                imgsz=self.yolo_imgsz,
+                device=self.runtime.yolo_device,
+                torch_module=torch,
+            )
+
         source_path = Path(self.yolo_model_source)
+        if (
+            yolo_auto_quantize
+            and source_path.is_file()
+            and source_path.suffix == ".pt"
+        ):
+            source_path = automatic_int8_path(source_path)
         openvino_ir_files = (
             list(source_path.glob("*.xml")) if source_path.is_dir() else []
         )
@@ -1044,33 +1082,8 @@ class YoloESamPipeline:
                         f"found {embedded_fingerprint or 'none'}). Enable automatic "
                         "INT8 quantization or select a matching model."
                     )
-                source_model = Path(
-                    resolve_yolo_model_source(yolo_source_model_id)
-                )
-                if yolo_int8_calibration_data is None:
-                    raise ValueError(
-                        "Automatic INT8 quantization requires calibration data"
-                    )
-                calibration_data = yolo_int8_calibration_data.expanduser()
-                if not calibration_data.is_absolute():
-                    calibration_data = PROJECT_ROOT / calibration_data
-                cache_root = (
-                    yolo_int8_cache_directory.expanduser()
-                    if yolo_int8_cache_directory is not None
-                    else PROJECT_ROOT / ".cache" / "yoloe" / "int8"
-                )
-                if not cache_root.is_absolute():
-                    cache_root = PROJECT_ROOT / cache_root
-                source_path = _export_fixed_prompt_openvino_int8(
-                    yoloe_type=YOLOE,
-                    initialize_visual_prompts=initialize_visual_prompts,
-                    source_model=source_model.resolve(),
-                    calibration_data=calibration_data.resolve(),
-                    cache_root=cache_root.resolve(),
-                    reference_fingerprint=self.reference_prompt_sha256,
-                    imgsz=self.yolo_imgsz,
-                    device=self.runtime.yolo_device,
-                    torch_module=torch,
+                source_path = automatic_int8_path(
+                    Path(resolve_yolo_model_source(yolo_source_model_id))
                 )
             self.yolo = YOLO(str(source_path), task="segment")
             self.yolo_runtime_source = str(source_path)

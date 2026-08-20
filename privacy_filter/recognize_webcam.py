@@ -247,10 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_prompt.add_argument(
         "--image-yolo-model",
-        default="models/yoloe/yoloe-26n-seg_int8_openvino_model",
+        default="models/yoloe/yoloe-26n-seg.pt",
         help=(
-            "YOLOE weights or fixed-prompt OpenVINO model directory; the default "
-            "INT8 export contains the DAVIS blackswan visual prompt"
+            "YOLOE weights or fixed-prompt OpenVINO model directory; by default "
+            "the .pt checkpoint is automatically quantized into the INT8 cache"
         ),
     )
     image_prompt.add_argument(
