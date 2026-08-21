@@ -151,6 +151,15 @@ python benchmarks\chokepoint_multi_owner_benchmark.py `
   --output-prefix benchmarks\my_multi_owner_test
 ```
 
+```linux
+python benchmarks/chokepoint_multi_owner_benchmark.py `
+  --sequence P1E_S1 `
+  --owners 0004,0010 `
+  --enrollment-samples 7 `
+  --threshold 0.38 `
+  --minimum-owner-face-size 70 `
+  --output-prefix benchmarks/my_multi_owner_test
+```
 Результаты сохраняются в `benchmarks/chokepoint_multi_owner.json` и покадровый
 `CSV`. Сгенерированные templates двух проходов находятся в
 `data/enrollments/chokepoint_multi_owner/pass_1` и `pass_2`.
